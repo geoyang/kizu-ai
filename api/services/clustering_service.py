@@ -278,53 +278,52 @@ class ClusteringService:
         cluster_id: str,
         limit: int = 4
     ) -> List[SampleFace]:
-        """Get sample faces for a cluster with thumbnail URLs."""
+        """Get sample faces for a cluster with thumbnail URLs.
+
+        Uses face_thumbnail_url from face_embeddings if available,
+        otherwise falls back to album_assets for legacy data.
+        """
         try:
-            # Get face embeddings with their asset info
+            # Get face embeddings with thumbnail URLs
             result = self._store._client.table("face_embeddings") \
-                .select("asset_id, face_index, bounding_box") \
+                .select("asset_id, face_index, bounding_box, face_thumbnail_url, is_from_video") \
                 .eq("cluster_id", cluster_id) \
-                .limit(limit) \
+                .limit(limit * 3) \
                 .execute()
 
             if not result.data:
                 return []
 
-            sample_faces = []
+            # Separate faces with and without thumbnails
+            faces_with_thumbnails = []
+            faces_without_thumbnails = []
+
             for row in result.data:
                 asset_id = row["asset_id"]
-                thumbnail_url = None
+                thumbnail_url = row.get("face_thumbnail_url")
+                is_from_video = row.get("is_from_video", False)
 
-                # Try to get asset thumbnail - check multiple columns
-                try:
-                    asset_result = self._store._client.table("assets") \
-                        .select("thumbnail, web_uri, asset_uri") \
-                        .eq("id", asset_id) \
-                        .single() \
-                        .execute()
-                    if asset_result.data:
-                        # Priority: base64 thumbnail > web_uri > asset_uri
-                        thumbnail = asset_result.data.get("thumbnail")
-                        web_uri = asset_result.data.get("web_uri")
-                        asset_uri = asset_result.data.get("asset_uri")
+                # If no face_thumbnail_url, try to get from album_assets (legacy fallback)
+                if not thumbnail_url:
+                    thumbnail_url = await self._get_asset_thumbnail(asset_id)
 
-                        # Use base64 thumbnail if available
-                        if thumbnail and thumbnail.startswith("data:"):
-                            thumbnail_url = thumbnail
-                        # Otherwise try web_uri (Google Photos URL)
-                        elif web_uri and web_uri.startswith("http"):
-                            thumbnail_url = web_uri
-                        # Fallback to asset_uri
-                        elif asset_uri and asset_uri.startswith("http"):
-                            thumbnail_url = asset_uri
-                except Exception as e:
-                    logger.debug(f"Could not get thumbnail for asset {asset_id}: {e}")
-
-                sample_faces.append(SampleFace(
+                face = SampleFace(
                     asset_id=asset_id,
                     face_index=row.get("face_index", 0),
-                    thumbnail_url=thumbnail_url
-                ))
+                    thumbnail_url=thumbnail_url,
+                    is_from_video=is_from_video
+                )
+
+                if thumbnail_url:
+                    faces_with_thumbnails.append(face)
+                else:
+                    faces_without_thumbnails.append(face)
+
+            # Prioritize faces with thumbnails
+            sample_faces = faces_with_thumbnails[:limit]
+            remaining = limit - len(sample_faces)
+            if remaining > 0:
+                sample_faces.extend(faces_without_thumbnails[:remaining])
 
             return sample_faces
 
@@ -332,14 +331,97 @@ class ClusteringService:
             logger.error(f"Failed to get sample faces: {e}")
             return []
 
+    async def _get_asset_thumbnail(self, asset_id: str) -> Optional[str]:
+        """Get thumbnail URL from album_assets table (legacy fallback)."""
+        try:
+            asset_result = self._store._client.table("album_assets") \
+                .select("asset_uri, thumbnail_uri, asset_type") \
+                .eq("asset_id", asset_id) \
+                .limit(1) \
+                .execute()
+
+            if not asset_result.data or len(asset_result.data) == 0:
+                return None
+
+            row_data = asset_result.data[0]
+            thumbnail_uri = row_data.get("thumbnail_uri")
+            asset_uri = row_data.get("asset_uri")
+            asset_type = row_data.get("asset_type", "photo")
+
+            # Use thumbnail_uri if available
+            if thumbnail_uri and thumbnail_uri.startswith("http"):
+                return thumbnail_uri
+
+            # For photos, use asset_uri directly
+            if asset_type == "photo" and asset_uri and asset_uri.startswith("http"):
+                return asset_uri
+
+            # For videos, only use if it's an image format
+            if asset_uri and asset_uri.startswith("http"):
+                lower_uri = asset_uri.lower()
+                if any(lower_uri.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif']):
+                    return asset_uri
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to get asset thumbnail for {asset_id}: {e}")
+            return None
+
+    async def get_all_faces_for_cluster(
+        self,
+        cluster_id: str,
+        user_id: str
+    ) -> List[dict]:
+        """Get ALL faces for a cluster (not just samples)."""
+        await self._store.connect()
+
+        try:
+            # Get all face embeddings for this cluster (include id for selection)
+            result = self._store._client.table("face_embeddings") \
+                .select("id, asset_id, face_index, bounding_box, face_thumbnail_url, is_from_video") \
+                .eq("cluster_id", cluster_id) \
+                .eq("user_id", user_id) \
+                .execute()
+
+            if not result.data:
+                return []
+
+            faces = []
+            for row in result.data:
+                asset_id = row["asset_id"]
+                thumbnail_url = row.get("face_thumbnail_url")
+                bounding_box = row.get("bounding_box")
+
+                # If no face_thumbnail_url, try to get from album_assets (legacy fallback)
+                if not thumbnail_url:
+                    thumbnail_url = await self._get_asset_thumbnail(asset_id)
+
+                faces.append({
+                    "id": row["id"],  # Face embedding ID for selection
+                    "asset_id": asset_id,
+                    "face_index": row.get("face_index", 0),
+                    "thumbnail_url": thumbnail_url,
+                    "is_from_video": row.get("is_from_video", False),
+                    "bounding_box": bounding_box
+                })
+
+            logger.info(f"Cluster {cluster_id}: returning {len(faces)} total faces")
+            return faces
+
+        except Exception as e:
+            logger.error(f"Failed to get all faces for cluster: {e}")
+            return []
+
     async def assign_cluster_to_contact(
         self,
         cluster_id: str,
         contact_id: str,
         name: Optional[str],
-        user_id: str
+        user_id: str,
+        exclude_face_ids: Optional[List[str]] = None
     ) -> bool:
-        """Assign a cluster to a Knox contact."""
+        """Assign a cluster to a Knox contact, optionally excluding certain faces."""
         await self._store.connect()
 
         try:
@@ -354,17 +436,79 @@ class ClusteringService:
                 .eq("user_id", user_id) \
                 .execute()
 
-            # Also update all face_embeddings in this cluster
-            self._store._client.table("face_embeddings") \
-                .update({"knox_contact_id": contact_id}) \
+            # Get all face embeddings in this cluster
+            faces_result = self._store._client.table("face_embeddings") \
+                .select("id") \
                 .eq("cluster_id", cluster_id) \
                 .execute()
 
-            logger.info(f"Assigned cluster {cluster_id} to contact {contact_id}")
+            if faces_result.data:
+                for face in faces_result.data:
+                    face_id = face["id"]
+                    if exclude_face_ids and face_id in exclude_face_ids:
+                        # Remove excluded faces from cluster (set cluster_id to null)
+                        self._store._client.table("face_embeddings") \
+                            .update({"cluster_id": None, "knox_contact_id": None}) \
+                            .eq("id", face_id) \
+                            .execute()
+                    else:
+                        # Assign to contact
+                        self._store._client.table("face_embeddings") \
+                            .update({"knox_contact_id": contact_id}) \
+                            .eq("id", face_id) \
+                            .execute()
+
+            # Update cluster face count
+            remaining_count = self._store._client.table("face_embeddings") \
+                .select("id", count="exact") \
+                .eq("cluster_id", cluster_id) \
+                .execute()
+
+            self._store._client.table("face_clusters") \
+                .update({"face_count": remaining_count.count or 0}) \
+                .eq("id", cluster_id) \
+                .execute()
+
+            logger.info(f"Assigned cluster {cluster_id} to contact {contact_id}, excluded {len(exclude_face_ids or [])} faces")
             return True
 
         except Exception as e:
             logger.error(f"Failed to assign cluster: {e}")
+            return False
+
+    async def remove_faces_from_cluster(
+        self,
+        cluster_id: str,
+        face_ids: List[str],
+        user_id: str
+    ) -> bool:
+        """Remove specific faces from a cluster."""
+        await self._store.connect()
+
+        try:
+            for face_id in face_ids:
+                self._store._client.table("face_embeddings") \
+                    .update({"cluster_id": None}) \
+                    .eq("id", face_id) \
+                    .eq("user_id", user_id) \
+                    .execute()
+
+            # Update cluster face count
+            remaining_count = self._store._client.table("face_embeddings") \
+                .select("id", count="exact") \
+                .eq("cluster_id", cluster_id) \
+                .execute()
+
+            self._store._client.table("face_clusters") \
+                .update({"face_count": remaining_count.count or 0}) \
+                .eq("id", cluster_id) \
+                .execute()
+
+            logger.info(f"Removed {len(face_ids)} faces from cluster {cluster_id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to remove faces from cluster: {e}")
             return False
 
     async def merge_clusters(

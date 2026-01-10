@@ -1,6 +1,8 @@
 """Service for processing images with AI models."""
 
+import io
 import logging
+import uuid
 from typing import List, Optional, Set
 from PIL import Image
 
@@ -188,9 +190,10 @@ class ProcessService:
         asset_id: str,
         image: Image.Image,
         user_id: str,
-        store: bool = True
+        store: bool = True,
+        is_from_video: bool = False
     ) -> dict:
-        """Detect faces and optionally store embeddings."""
+        """Detect faces, extract thumbnails, and optionally store embeddings."""
         face_model = ModelRegistry.get(ModelType.FACE)
         result = face_model.detect_and_embed(image)
 
@@ -198,6 +201,11 @@ class ProcessService:
         if store:
             for face in result.faces:
                 if face.embedding is not None:
+                    # Extract and upload face thumbnail
+                    face_thumbnail_url = await self._extract_and_upload_face_thumbnail(
+                        image, face.bounding_box, asset_id, face.face_index, user_id
+                    )
+
                     await self._store.store_embedding(
                         collection="face_embeddings",
                         id=f"{asset_id}_{face.face_index}",
@@ -206,7 +214,9 @@ class ProcessService:
                             "asset_id": asset_id,
                             "face_index": face.face_index,
                             "bounding_box": face.bounding_box.to_dict(),
-                            "user_id": user_id
+                            "user_id": user_id,
+                            "face_thumbnail_url": face_thumbnail_url,
+                            "is_from_video": is_from_video
                         }
                     )
 
@@ -223,6 +233,77 @@ class ProcessService:
                 for f in result.faces
             ]
         }
+
+    async def _extract_and_upload_face_thumbnail(
+        self,
+        image: Image.Image,
+        bounding_box,
+        asset_id: str,
+        face_index: int,
+        user_id: str,
+        padding: float = 0.3,
+        thumbnail_size: int = 150
+    ) -> Optional[str]:
+        """Extract face crop from image and upload to storage."""
+        from PIL import ImageOps
+        try:
+            if not bounding_box:
+                return None
+
+            # Apply EXIF orientation if not already applied
+            image = ImageOps.exif_transpose(image)
+
+            # Get bounding box coordinates
+            x = bounding_box.x
+            y = bounding_box.y
+            width = bounding_box.width
+            height = bounding_box.height
+
+            # Add padding around the face (30% extra on each side)
+            pad_x = width * padding
+            pad_y = height * padding
+
+            left = max(0, int(x - pad_x))
+            top = max(0, int(y - pad_y))
+            right = min(image.width, int(x + width + pad_x))
+            bottom = min(image.height, int(y + height + pad_y))
+
+            # Crop the face region
+            face_crop = image.crop((left, top, right, bottom))
+
+            # Resize to thumbnail size (square)
+            face_crop.thumbnail((thumbnail_size, thumbnail_size), Image.Resampling.LANCZOS)
+
+            # Convert to JPEG bytes
+            buffer = io.BytesIO()
+            face_crop.save(buffer, format='JPEG', quality=85)
+            buffer.seek(0)
+            image_bytes = buffer.getvalue()
+
+            # Upload to Supabase storage
+            from supabase import create_client
+
+            supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
+
+            # Create unique filename: user_id/asset_id_face_index.jpg
+            filename = f"{user_id}/{asset_id}_{face_index}.jpg"
+
+            # Upload to face-thumbnails bucket
+            result = supabase.storage.from_('face-thumbnails').upload(
+                filename,
+                image_bytes,
+                file_options={"content-type": "image/jpeg", "upsert": "true"}
+            )
+
+            # Get public URL
+            public_url = supabase.storage.from_('face-thumbnails').get_public_url(filename)
+
+            logger.info(f"Uploaded face thumbnail: {filename}")
+            return public_url
+
+        except Exception as e:
+            logger.error(f"Failed to extract/upload face thumbnail: {e}")
+            return None
 
     async def _extract_text(
         self,

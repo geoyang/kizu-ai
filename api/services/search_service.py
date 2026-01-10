@@ -103,7 +103,11 @@ class SearchService:
         return store_filters
 
     async def _get_thumbnails(self, asset_ids: List[str]) -> dict:
-        """Fetch web_uri for assets from the assets table."""
+        """Fetch correctly-oriented thumbnail URLs for assets.
+
+        Uses album_assets.thumbnail_uri which contains EXIF-corrected thumbnails.
+        Falls back to assets table if album_assets doesn't have the asset.
+        """
         if not asset_ids:
             return {}
 
@@ -112,14 +116,32 @@ class SearchService:
             from api.config import settings
 
             supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
-            result = supabase.table('assets').select('id, web_uri, thumbnail, path').in_('id', asset_ids).execute()
-
             thumbnails = {}
-            for row in result.data:
-                # Prefer web_uri, then thumbnail, then path
-                url = row.get('web_uri') or row.get('thumbnail') or row.get('path')
-                if url:
-                    thumbnails[row['id']] = url
+
+            # First try album_assets which has properly oriented thumbnails
+            album_result = supabase.table('album_assets') \
+                .select('asset_id, thumbnail_uri, asset_uri') \
+                .in_('asset_id', asset_ids) \
+                .execute()
+
+            for row in album_result.data:
+                # Prefer thumbnail_uri (EXIF-corrected), then asset_uri
+                url = row.get('thumbnail_uri') or row.get('asset_uri')
+                if url and url.startswith('http'):
+                    thumbnails[row['asset_id']] = url
+
+            # For any assets not found in album_assets, try assets table
+            missing_ids = [aid for aid in asset_ids if aid not in thumbnails]
+            if missing_ids:
+                assets_result = supabase.table('assets') \
+                    .select('id, web_uri, thumbnail, path') \
+                    .in_('id', missing_ids) \
+                    .execute()
+
+                for row in assets_result.data:
+                    url = row.get('web_uri') or row.get('thumbnail') or row.get('path')
+                    if url:
+                        thumbnails[row['id']] = url
 
             return thumbnails
         except Exception as e:

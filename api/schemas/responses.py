@@ -54,11 +54,21 @@ class ProcessingJobResponse(BaseModel):
     completed_at: Optional[datetime] = None
 
 
+class BoundingBox(BaseModel):
+    """Bounding box for a detected face."""
+    x: float
+    y: float
+    width: float
+    height: float
+
+
 class SampleFace(BaseModel):
     """A sample face from a cluster."""
     asset_id: str
     face_index: int
     thumbnail_url: Optional[str] = None
+    is_from_video: bool = False
+    bounding_box: Optional[Dict[str, Any]] = None
 
 
 class FaceClusterResponse(BaseModel):
