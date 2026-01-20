@@ -29,6 +29,7 @@ class SearchResult(BaseModel):
     description: Optional[str] = None
     matched_faces: Optional[List[MatchedFace]] = None
     matched_objects: Optional[List[str]] = None
+    matched_location: Optional[str] = None  # Location name from asset metadata
     thumbnail_url: Optional[str] = None
 
 

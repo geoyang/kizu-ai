@@ -29,6 +29,7 @@ easyocr>=1.7.0
 # Vision-Language Model
 transformers>=4.36.0
 accelerate>=0.25.0
+bitsandbytes>=0.42.0  # For INT8/INT4 quantization
 
 # Clustering
 hdbscan>=0.8.33

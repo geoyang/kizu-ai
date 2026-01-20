@@ -31,7 +31,8 @@ def register_models():
         YOLODetector,
         InsightFaceModel,
         EasyOCRModel,
-        LLaVAModel,
+        BLIP2Model,
+        Florence2Model,
     )
 
     # Register embedders
@@ -76,12 +77,24 @@ def register_models():
         is_default=True
     )
 
-    # Register VLM (optional)
+    # Register VLM (BLIP-2 - lightweight alternative to LLaVA)
     ModelRegistry.register(
         ModelType.VLM,
-        "llava",
-        lambda: LLaVAModel(cache_dir=settings.model_cache_dir),
-        is_default=settings.default_vlm is not None
+        "blip2",
+        lambda: BLIP2Model(cache_dir=settings.model_cache_dir),
+        is_default=settings.default_vlm == "blip2"
+    )
+
+    # Register Florence-2 VLM (Microsoft's efficient multimodal model)
+    ModelRegistry.register(
+        ModelType.VLM,
+        "florence2",
+        lambda: Florence2Model(
+            model_name=settings.florence_model,
+            cache_dir=settings.model_cache_dir,
+            quantization=settings.vlm_quantization
+        ),
+        is_default=settings.default_vlm == "florence2"
     )
 
     logger.info("Models registered")

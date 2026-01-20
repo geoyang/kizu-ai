@@ -162,3 +162,106 @@ async def process_webhook(
 
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+
+@router.post("/reindex")
+async def reindex_all_assets(
+    background_tasks: BackgroundTasks,
+    limit: int = 100,
+    offset: int = 0,
+    process_service: ProcessService = Depends(get_process_service),
+    user_id: str = Depends(get_current_user_id)
+):
+    """
+    Reindex assets that don't have embeddings.
+
+    Call this endpoint repeatedly with increasing offset to process all assets.
+    Use limit to control batch size.
+    """
+    from supabase import create_client
+    from api.config import settings
+    import logging
+
+    logger = logging.getLogger(__name__)
+    supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
+
+    try:
+        # Get assets that don't have embeddings yet
+        # First get all asset IDs
+        assets_result = supabase.table('assets') \
+            .select('id, web_uri') \
+            .eq('user_id', user_id) \
+            .range(offset, offset + limit - 1) \
+            .execute()
+
+        if not assets_result.data:
+            return {
+                "status": "complete",
+                "message": "No more assets to process",
+                "processed": 0,
+                "offset": offset
+            }
+
+        asset_ids = [a['id'] for a in assets_result.data]
+
+        # Check which already have embeddings
+        embeddings_result = supabase.table('image_embeddings') \
+            .select('asset_id') \
+            .in_('asset_id', asset_ids) \
+            .execute()
+
+        existing_ids = {e['asset_id'] for e in embeddings_result.data}
+        assets_to_process = [a for a in assets_result.data if a['id'] not in existing_ids]
+
+        if not assets_to_process:
+            return {
+                "status": "skipped",
+                "message": f"All {len(asset_ids)} assets in this batch already processed",
+                "processed": 0,
+                "offset": offset,
+                "next_offset": offset + limit
+            }
+
+        # Process each asset
+        processed = 0
+        errors = []
+
+        for asset in assets_to_process:
+            try:
+                image_url = asset.get('web_uri')
+                if not image_url:
+                    continue
+
+                image = load_image(image_url)
+                from api.schemas.requests import ProcessingOperation
+
+                await process_service.process_image(
+                    asset_id=asset['id'],
+                    image=image,
+                    operations=[
+                        ProcessingOperation.EMBEDDING,
+                        ProcessingOperation.OBJECTS,
+                        ProcessingOperation.FACES
+                    ],
+                    user_id=user_id
+                )
+                processed += 1
+                logger.info(f"Reindexed asset {asset['id'][:8]}... ({processed}/{len(assets_to_process)})")
+
+            except Exception as e:
+                errors.append({"asset_id": asset['id'], "error": str(e)})
+                logger.error(f"Failed to reindex {asset['id']}: {e}")
+
+        return {
+            "status": "success",
+            "processed": processed,
+            "errors": len(errors),
+            "error_details": errors[:5] if errors else None,
+            "offset": offset,
+            "next_offset": offset + limit,
+            "message": f"Processed {processed}/{len(assets_to_process)} assets"
+        }
+
+    except Exception as e:
+        logger.error(f"Reindex failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

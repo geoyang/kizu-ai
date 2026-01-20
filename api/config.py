@@ -24,7 +24,9 @@ class Settings(BaseSettings):
     default_detector: str = "yolo"
     default_face_model: str = "insightface"
     default_ocr: str = "easyocr"
-    default_vlm: Optional[str] = "llava"  # Enable LLaVA for image descriptions
+    default_vlm: Optional[str] = "florence2"  # Options: blip2, florence2, llava
+    florence_model: str = "microsoft/Florence-2-base"  # or "microsoft/Florence-2-large"
+    vlm_quantization: Optional[str] = "int8"  # Options: None, "int8", "int4"
 
     # CLIP settings
     clip_model: str = "ViT-B-32"

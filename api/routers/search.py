@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Optional
 
-from api.schemas import SearchRequest, SearchResponse, SearchResult
+from api.schemas import SearchRequest, SearchResponse, SearchResult, FaceSearchRequest
 from api.services import SearchService
 from api.dependencies import get_search_service, get_current_user_id
 
@@ -26,13 +26,14 @@ async def search_images(
     - "photos with text or signs"
     """
     try:
-        results, elapsed_ms = await search_service.search(request, user_id)
+        results, elapsed_ms, query_parsed = await search_service.search(request, user_id)
 
         return SearchResponse(
             status="completed",
             results=results,
             total=len(results),
-            processing_time_ms=elapsed_ms
+            processing_time_ms=elapsed_ms,
+            query_parsed=query_parsed
         )
 
     except Exception as e:
@@ -41,30 +42,53 @@ async def search_images(
 
 @router.post("/by-face", response_model=SearchResponse)
 async def search_by_face(
-    contact_id: Optional[str] = None,
-    cluster_id: Optional[str] = None,
-    threshold: float = 0.6,
-    limit: int = 50,
+    request: FaceSearchRequest,
     search_service: SearchService = Depends(get_search_service),
     user_id: str = Depends(get_current_user_id)
 ):
     """
     Search images containing a specific person.
 
-    Provide either contact_id (Knox contact) or cluster_id (face cluster).
+    Provide either contact_id (Knox contact), cluster_id (face cluster),
+    or face_embedding (direct embedding search).
     """
-    if not contact_id and not cluster_id:
+    if not request.contact_id and not request.cluster_id and not request.face_embedding:
         raise HTTPException(
             status_code=400,
-            detail="Either contact_id or cluster_id required"
+            detail="Either contact_id, cluster_id, or face_embedding required"
         )
 
-    # Implementation would get face embedding and search
-    return SearchResponse(
-        status="completed",
-        results=[],
-        total=0
-    )
+    try:
+        # Get face embedding from contact or cluster
+        face_embedding = request.face_embedding
+        if not face_embedding:
+            face_embedding = await search_service.get_face_embedding(
+                contact_id=request.contact_id,
+                cluster_id=request.cluster_id
+            )
+
+        if not face_embedding:
+            return SearchResponse(
+                status="completed",
+                results=[],
+                total=0
+            )
+
+        results = await search_service.search_by_face(
+            face_embedding=face_embedding,
+            user_id=user_id,
+            limit=request.limit,
+            threshold=request.threshold
+        )
+
+        return SearchResponse(
+            status="completed",
+            results=results,
+            total=len(results)
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/by-object", response_model=SearchResponse)

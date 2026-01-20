@@ -6,6 +6,7 @@ from .requests import (
     BatchProcessRequest,
     ClusterFacesRequest,
     AssignClusterRequest,
+    FaceSearchRequest,
 )
 from .responses import (
     SearchResponse,
@@ -22,6 +23,7 @@ __all__ = [
     "BatchProcessRequest",
     "ClusterFacesRequest",
     "AssignClusterRequest",
+    "FaceSearchRequest",
     # Responses
     "SearchResponse",
     "SearchResult",
