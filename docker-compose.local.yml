@@ -1,0 +1,54 @@
+version: '3.8'
+
+# Local Worker Docker Compose
+# Uses Supabase Realtime instead of Redis/Celery
+# Run with: docker-compose -f docker-compose.local.yml up
+
+services:
+  # API server for testing (optional - worker can run standalone)
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/api
+    ports:
+      - "8000:8000"
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - MODEL_CACHE_DIR=/app/model_cache
+      - DEBUG=${DEBUG:-true}
+    volumes:
+      - model_cache:/app/model_cache
+      - ./api:/app/api
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Local worker - pulls jobs from Supabase
+  worker:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    command: python run_worker.py --poll-interval 5
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - MODEL_CACHE_DIR=/app/model_cache
+      - WORKER_ID=${WORKER_ID:-docker-worker}
+    volumes:
+      - model_cache:/app/model_cache
+      - ./api:/app/api
+      - ./run_worker.py:/app/run_worker.py
+    restart: unless-stopped
+    # No depends_on - worker is self-contained, connects to Supabase directly
+
+volumes:
+  model_cache:
+    driver: local

@@ -4,36 +4,49 @@ A privacy-first, locally-hosted AI engine for image intelligence. All processing
 
 ## System Overview
 
+The system uses a **pull-based architecture** where local AI workers pull jobs from Supabase. This allows the AI engine to run anywhere (home NAS, laptop, cloud) without requiring a public endpoint.
+
 ```
-                          +-------------------+
-                          |   Kizu Mobile /   |
-                          |   Web App         |
-                          +--------+----------+
-                                   |
-                                   v
-+------------------------------------------------------------------+
-|                    Docker Compose Stack                           |
-|  +---------------+    +-----------+    +----------------------+  |
-|  |   FastAPI     |<-->|   Redis   |<-->|   Celery Workers     |  |
-|  |   :8000       |    |   :6379   |    |   (AI Processing)    |  |
-|  +---------------+    +-----------+    +----------------------+  |
-|                                                                   |
-|  AI Models: OpenCLIP | YOLOv8 | InsightFace | EasyOCR | LLaVA    |
-+------------------------------------------------------------------+
-                                   |
-                                   v
-                          +-------------------+
-                          |    Supabase       |
-                          |    (pgvector)     |
-                          +-------------------+
++-------------------+          +----------------------------------------+
+|   Kizu Mobile /   |          |              SUPABASE (Cloud)          |
+|   Web App         |          |                                        |
++--------+----------+          |  +------------+    +-----------------+ |
+         |                     |  |  Storage   |    | processing_queue| |
+         | Upload              |  |  (images)  |    |   (job queue)   | |
+         v                     |  +-----+------+    +--------+--------+ |
++-------------------+          |        |  trigger          |           |
+|  Supabase Storage |--------->|        v                   | Realtime  |
++-------------------+          |  +------------+            | WebSocket |
+                               |  | Insert job |            |           |
+                               |  +------------+            |           |
+                               +----------------------------------------+
+                                                            |
+                              ============ INTERNET =========
+                                                            |
+                               +----------------------------v-----------+
+                               |          LOCAL AI (Your NAS/PC)        |
+                               |                                        |
+                               |  +----------------------------------+  |
+                               |  |         Local Worker             |  |
+                               |  |                                  |  |
+                               |  |  1. Subscribe to Realtime        |  |
+                               |  |  2. Claim job atomically         |  |
+                               |  |  3. Download & process image     |  |
+                               |  |  4. Store results to Supabase    |  |
+                               |  +----------------------------------+  |
+                               |                                        |
+                               |  Models: CLIP | YOLO | InsightFace |   |
+                               |          Florence-2 | EasyOCR         |
+                               +----------------------------------------+
 ```
 
 ## Core Components
 
 | Component | Purpose | Technology |
 |-----------|---------|------------|
-| API Gateway | REST endpoints, request routing | FastAPI (uvicorn) |
-| Task Queue | Async job processing | Celery + Redis |
+| API Gateway | REST endpoints for testing | FastAPI (uvicorn) |
+| Local Worker | Pull-based job processing | Supabase Realtime + async Python |
+| Processing Queue | Job queue with atomic claims | Supabase `processing_queue` table |
 | Vector Storage | Embedding similarity search | Supabase pgvector |
 | Model Registry | Dynamic model loading/swapping | Custom registry pattern |
 
@@ -75,17 +88,22 @@ Kizu-AI/
 │   ├── stores/                    # Data persistence
 │   │   └── supabase_store.py      # pgvector operations
 │   ├── workers/                   # Background processing
-│   │   ├── celery_app.py          # Celery configuration
-│   │   └── tasks.py               # Async task definitions
+│   │   ├── local_worker.py        # Pull-based Supabase Realtime worker
+│   │   ├── celery_app.py          # Legacy Celery config (optional)
+│   │   └── tasks.py               # Legacy Celery tasks (optional)
 │   └── utils/                     # Shared utilities
 │       ├── device_utils.py        # CPU/GPU detection
 │       ├── image_utils.py         # Image loading/processing
 │       └── date_parser.py         # NLP date extraction
 ├── migrations/                    # Database schema (SQL)
+│   ├── 001_ai_tables.sql          # Core AI tables (embeddings, faces, etc.)
+│   └── 002_processing_queue.sql   # Pull-based job queue
 ├── scripts/
 │   └── download_models.py         # Model downloader
 ├── model_cache/                   # Downloaded model weights
-├── docker-compose.yml             # Development stack
+├── run_worker.py                  # Local worker entry point
+├── docker-compose.yml             # Legacy stack (with Redis/Celery)
+├── docker-compose.local.yml       # Recommended: local worker stack
 └── docker-compose.prod.yml        # Production stack
 ```
 
@@ -272,34 +290,64 @@ model = ModelRegistry.get(ModelType.NEW_TYPE, "mymodel-large")
 ModelRegistry.unload(ModelType.NEW_TYPE, "mymodel")
 ```
 
+## Local Worker
+
+The recommended way to run Kizu-AI is using the pull-based local worker.
+
+### Running the Worker
+
+```bash
+# Direct Python
+python run_worker.py
+
+# With options
+python run_worker.py --worker-id my-nas --poll-interval 10 --debug
+
+# Docker
+docker-compose -f docker-compose.local.yml up worker
+```
+
+### How It Works
+
+1. **Supabase Realtime subscription**: Worker subscribes to `processing_queue` INSERT events
+2. **Atomic job claiming**: Uses `claim_processing_job()` RPC with `FOR UPDATE SKIP LOCKED`
+3. **Polling fallback**: Also polls every N seconds in case Realtime misses events
+4. **Auto-retry**: Failed jobs retry up to `max_attempts` (default: 3)
+5. **Stale job recovery**: `reset_stale_processing_jobs()` resets stuck jobs
+
+### Processing Queue Schema
+
+```sql
+processing_queue
+├── id              UUID PRIMARY KEY
+├── asset_id        UUID (references assets)
+├── user_id         UUID (references auth.users)
+├── status          TEXT ('pending'|'processing'|'completed'|'failed')
+├── operations      TEXT[] (e.g., ['embedding','objects','faces'])
+├── worker_id       TEXT (claims ownership)
+├── priority        INT (1=highest, 10=lowest)
+├── attempts        INT
+├── result          JSONB
+├── error           TEXT
+└── timestamps      (created_at, started_at, completed_at)
+```
+
+### Why Pull-Based?
+
+| Push (Webhook) | Pull (Realtime) |
+|----------------|-----------------|
+| Requires public endpoint | Works behind NAT/firewall |
+| Single point of failure | Multiple workers anywhere |
+| Complex networking | Simple: just outbound HTTPS |
+
 ## Performance Considerations
 
 ### Memory Management
 
-- **Single worker concurrency**: Celery runs 1 worker to avoid OOM with multiple large models
+- **Single-threaded processing**: One job at a time to avoid OOM
 - **Lazy loading**: Models load on first use, not at startup
 - **Explicit unload**: `/models/unload-all` frees GPU/CPU memory
-- **Prefetch multiplier 1**: Process one task at a time
-
-### Celery Configuration
-
-```python
-worker_prefetch_multiplier=1    # One task at a time
-worker_concurrency=1            # Single worker
-task_time_limit=3600            # 1 hour max per task
-task_soft_time_limit=3000       # 50 min soft limit
-result_expires=86400            # Results expire after 24h
-```
-
-### Task Routing
-
-```python
-task_routes = {
-    "process_image_task": {"queue": "default"},
-    "batch_process_task": {"queue": "batch"},
-    "cluster_faces_task": {"queue": "batch"},
-}
-```
+- **Async I/O**: Network operations don't block model inference
 
 ### Hardware Requirements
 
@@ -346,14 +394,16 @@ InsightFace uses `CPUExecutionProvider` for cross-platform compatibility (M1/AMD
 | `assets` | Source image metadata |
 | `album_assets` | Thumbnail references |
 
-### Webhook Flow
+### Processing Flow (Pull-Based)
 
 1. User uploads image to Kizu Mobile/Web
-2. Supabase trigger calls edge function
-3. Edge function calls `/api/v1/process/webhook`
-4. AI processes image (embedding, faces, objects)
-5. Results stored in Supabase tables
-6. Search immediately available
+2. Image stored in Supabase Storage
+3. Database trigger inserts job into `processing_queue`
+4. Local worker receives Realtime notification (or polls)
+5. Worker claims job atomically, downloads image
+6. AI processes image (embedding, faces, objects)
+7. Results stored in Supabase pgvector tables
+8. Job marked completed, search immediately available
 
 ### Search Flow
 
