@@ -196,7 +196,8 @@ class LocalWorker:
                 image=image,
                 operations=ops,
                 user_id=user_id,
-                store_results=True
+                store_results=True,
+                worker_id=self._worker_id
             )
 
             # Mark job as completed

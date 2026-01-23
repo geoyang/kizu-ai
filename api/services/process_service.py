@@ -29,7 +29,8 @@ class ProcessService:
         operations: List[ProcessingOperation],
         user_id: str,
         store_results: bool = True,
-        force_reprocess: bool = False
+        force_reprocess: bool = False,
+        worker_id: str = None
     ) -> dict:
         """
         Process a single image with specified operations.
@@ -75,7 +76,7 @@ class ProcessService:
         # Mark asset as AI processed
         if store_results:
             operation_names = [op.value for op in ops]
-            await self._mark_asset_processed(asset_id, operation_names)
+            await self._mark_asset_processed(asset_id, operation_names, worker_id)
 
         return results
 
@@ -384,19 +385,46 @@ class ProcessService:
         except Exception as e:
             logger.warning(f"Failed to clear AI data for asset {asset_id}: {e}")
 
-    async def _mark_asset_processed(self, asset_id: str, operations: List[str]) -> None:
-        """Mark an asset as AI processed with timestamp and operations."""
+    async def _mark_asset_processed(
+        self,
+        asset_id: str,
+        operations: List[str],
+        worker_id: str = None
+    ) -> None:
+        """Mark an asset as AI processed with timestamp, operations, and model versions."""
         from supabase import create_client
+        from datetime import datetime, timezone
 
         try:
             supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
 
+            # Build model versions based on operations performed
+            model_versions = {}
+            if 'embedding' in operations:
+                model_versions['clip'] = settings.clip_model
+            if 'objects' in operations:
+                model_versions['yolo'] = f"v8-{settings.yolo_size}"
+            if 'faces' in operations:
+                model_versions['insightface'] = settings.face_model_name
+            if 'ocr' in operations:
+                model_versions['ocr'] = 'easyocr'
+            if 'describe' in operations:
+                model_versions['vlm'] = settings.default_vlm
+
+            now = datetime.now(timezone.utc)
+
             supabase.table('assets').update({
-                'ai_processed_at': 'now()',
-                'ai_processed_operations': operations
+                'ai_processed_at': now.isoformat(),
+                'ai_processed_date': now.date().isoformat(),
+                'ai_processed_by': worker_id,
+                'ai_processed_operations': operations,
+                'ai_model_versions': model_versions
             }).eq('id', asset_id).execute()
 
-            logger.debug(f"Marked asset {asset_id} as AI processed with operations: {operations}")
+            logger.debug(
+                f"Marked asset {asset_id} as AI processed: "
+                f"operations={operations}, worker={worker_id}, models={model_versions}"
+            )
 
         except Exception as e:
             logger.warning(f"Failed to mark asset {asset_id} as processed: {e}")

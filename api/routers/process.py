@@ -65,7 +65,8 @@ async def process_single_image(
             operations=request.operations,
             user_id=user_id,
             store_results=request.store_results,
-            force_reprocess=request.force_reprocess
+            force_reprocess=request.force_reprocess,
+            worker_id="api-direct"
         )
 
         return {
@@ -155,7 +156,8 @@ async def process_webhook(
                 ProcessingOperation.OBJECTS,
                 ProcessingOperation.FACES
             ],
-            user_id=user_id
+            user_id=user_id,
+            worker_id="api-webhook"
         )
 
         return {"status": "processed", "result": result}
@@ -243,7 +245,8 @@ async def reindex_all_assets(
                         ProcessingOperation.OBJECTS,
                         ProcessingOperation.FACES
                     ],
-                    user_id=user_id
+                    user_id=user_id,
+                    worker_id="api-reindex"
                 )
                 processed += 1
                 logger.info(f"Reindexed asset {asset['id'][:8]}... ({processed}/{len(assets_to_process)})")
