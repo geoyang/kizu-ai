@@ -4,6 +4,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from typing import Optional
 
 from api.schemas import SearchRequest, SearchResponse, SearchResult, FaceSearchRequest
+from api.schemas.requests import (
+    DescriptionSearchRequest,
+    TextSearchRequest,
+    CombinedSearchRequest,
+)
 from api.services import SearchService
 from api.dependencies import get_search_service, get_current_user_id
 
@@ -149,6 +154,109 @@ async def get_detected_objects(
         }
     except Exception as e:
         return {"objects": [], "error": str(e)}
+
+
+@router.post("/by-description", response_model=SearchResponse)
+async def search_by_description(
+    request: DescriptionSearchRequest,
+    search_service: SearchService = Depends(get_search_service),
+    user_id: str = Depends(get_current_user_id)
+):
+    """
+    Search images by AI-generated description text.
+
+    Uses fuzzy matching (ILIKE) against the image_descriptions table.
+    Example: query="birthday cake" finds images described as containing birthday cakes.
+    """
+    try:
+        results, elapsed_ms = await search_service.search_by_description(
+            query=request.query,
+            user_id=user_id,
+            limit=request.limit
+        )
+
+        return SearchResponse(
+            status="completed",
+            results=results,
+            total=len(results),
+            processing_time_ms=elapsed_ms
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/by-text", response_model=SearchResponse)
+async def search_by_ocr_text(
+    request: TextSearchRequest,
+    search_service: SearchService = Depends(get_search_service),
+    user_id: str = Depends(get_current_user_id)
+):
+    """
+    Search images by OCR-extracted text.
+
+    Finds images containing the specified text (signs, documents, etc.).
+    Example: query="stop" finds images with stop signs.
+    """
+    try:
+        results, elapsed_ms = await search_service.search_by_text(
+            query=request.query,
+            user_id=user_id,
+            limit=request.limit
+        )
+
+        return SearchResponse(
+            status="completed",
+            results=results,
+            total=len(results),
+            processing_time_ms=elapsed_ms
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/combined", response_model=SearchResponse)
+async def search_combined(
+    request: CombinedSearchRequest,
+    search_service: SearchService = Depends(get_search_service),
+    user_id: str = Depends(get_current_user_id)
+):
+    """
+    Combined multi-filter search.
+
+    Supports combining:
+    - Semantic query (CLIP-based similarity)
+    - Date range (date_start, date_end)
+    - People (contact_ids or cluster_ids)
+    - Objects (object_classes detected by YOLO)
+    - Description text (AI-generated descriptions)
+    - OCR text (extracted text from images)
+
+    All filters use AND logic - results must match all specified criteria.
+    """
+    if not request.query and not request.filters:
+        raise HTTPException(
+            status_code=400,
+            detail="Either query or filters must be provided"
+        )
+
+    try:
+        results, elapsed_ms, metadata = await search_service.combined_search(
+            user_id=user_id,
+            query=request.query,
+            filters=request.filters,
+            limit=request.limit,
+            threshold=request.threshold
+        )
+
+        return SearchResponse(
+            status="completed",
+            results=results,
+            total=len(results),
+            processing_time_ms=elapsed_ms,
+            query_parsed=metadata
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/suggestions")

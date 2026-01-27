@@ -12,14 +12,11 @@ services:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
-      - REDIS_URL=redis://redis:6379/0
       - MODEL_CACHE_DIR=/app/model_cache
       - DEBUG=${DEBUG:-true}
     volumes:
       - model_cache:/app/model_cache
       - ./api:/app/api  # Mount for hot-reload
-    depends_on:
-      - redis
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -32,35 +29,18 @@ services:
     build:
       context: .
       dockerfile: api/Dockerfile
-    command: watchmedo auto-restart --directory=/app/api --pattern=*.py --recursive -- celery -A api.workers.celery_app worker --loglevel=info
+    command: watchmedo auto-restart --directory=/app/api --pattern=*.py --recursive -- python run_worker.py --debug
     environment:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
-      - REDIS_URL=redis://redis:6379/0
       - MODEL_CACHE_DIR=/app/model_cache
     volumes:
       - model_cache:/app/model_cache
       - ./api:/app/api  # Mount for hot-reload
-    depends_on:
-      - redis
+      - ./run_worker.py:/app/run_worker.py  # Mount worker script
     restart: unless-stopped
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
 
 volumes:
   model_cache:
-    driver: local
-  redis_data:
     driver: local

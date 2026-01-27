@@ -1,18 +1,28 @@
 """Face recognition API router."""
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import uuid
 
 from api.schemas import (
     ClusterFacesRequest,
     AssignClusterRequest,
+    MergeClustersRequest,
     ProcessingJobResponse,
+    TagSyncPreviewRequest,
+    ApplyTagSyncRequest,
 )
 from api.schemas.responses import (
     JobStatus,
     FaceClusterResponse,
     FaceClustersListResponse,
+    TagSyncPreviewResponse,
+    TagSyncSummary,
+    AssetTagPreview,
+    ManualTag,
+    AIDetection,
+    TagMatch,
+    BoundingBox,
 )
 from api.services import FaceService, ClusteringService
 from api.dependencies import (
@@ -20,6 +30,35 @@ from api.dependencies import (
     get_clustering_service,
     get_current_user_id
 )
+
+
+def calculate_iou(box1: Dict[str, float], box2: Dict[str, float]) -> float:
+    """Calculate Intersection over Union between two bounding boxes."""
+    x1_1, y1_1 = box1.get("x", 0), box1.get("y", 0)
+    x2_1 = x1_1 + box1.get("width", 0)
+    y2_1 = y1_1 + box1.get("height", 0)
+
+    x1_2, y1_2 = box2.get("x", 0), box2.get("y", 0)
+    x2_2 = x1_2 + box2.get("width", 0)
+    y2_2 = y1_2 + box2.get("height", 0)
+
+    inter_x1 = max(x1_1, x1_2)
+    inter_y1 = max(y1_1, y1_2)
+    inter_x2 = min(x2_1, x2_2)
+    inter_y2 = min(y2_1, y2_2)
+
+    if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+        return 0.0
+
+    inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+    box1_area = box1.get("width", 0) * box1.get("height", 0)
+    box2_area = box2.get("width", 0) * box2.get("height", 0)
+    union_area = box1_area + box2_area - inter_area
+
+    if union_area <= 0:
+        return 0.0
+
+    return inter_area / union_area
 
 router = APIRouter(prefix="/faces", tags=["faces"])
 
@@ -188,19 +227,19 @@ async def remove_faces_from_cluster(
 
 @router.post("/clusters/merge")
 async def merge_clusters(
-    cluster_ids: List[str],
+    request: MergeClustersRequest,
     clustering_service: ClusteringService = Depends(get_clustering_service),
     user_id: str = Depends(get_current_user_id)
 ):
     """Merge multiple clusters into one."""
-    if len(cluster_ids) < 2:
+    if len(request.cluster_ids) < 2:
         raise HTTPException(
             status_code=400,
             detail="Need at least 2 clusters to merge"
         )
 
     new_cluster_id = await clustering_service.merge_clusters(
-        cluster_ids, user_id
+        request.cluster_ids, user_id
     )
 
     return {"status": "merged", "new_cluster_id": new_cluster_id}
@@ -505,3 +544,255 @@ async def run_backfill_thumbnails_task(
         import logging
         logging.error(f"Backfill thumbnails failed: {e}")
         update_job(job_id, status="failed", error_message=str(e))
+
+
+@router.post("/tag-sync/preview", response_model=TagSyncPreviewResponse)
+async def preview_tag_sync(
+    request: TagSyncPreviewRequest,
+    user_id: str = Depends(get_current_user_id)
+):
+    """
+    Preview manual tag to AI detection bounding box matching.
+
+    Compares manual face tags from the mobile app with AI-detected faces
+    using IoU (Intersection over Union) to find matches.
+    """
+    from api.config import settings
+    from supabase import create_client
+    import logging
+
+    try:
+        supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
+
+        # Get assets with manual tags
+        tags_query = supabase.table("asset_tags") \
+            .select("id, asset_id, contact_id, bounding_box, contacts!inner(id, display_name)") \
+            .eq("user_id", user_id) \
+            .not_.is_("bounding_box", "null")
+
+        if request.asset_ids:
+            tags_query = tags_query.in_("asset_id", request.asset_ids)
+
+        tags_result = tags_query.limit(request.limit * 10).execute()
+        manual_tags_data = tags_result.data or []
+
+        if not manual_tags_data:
+            return TagSyncPreviewResponse(
+                assets=[],
+                summary=TagSyncSummary(
+                    total_assets=0,
+                    total_manual_tags=0,
+                    total_ai_faces=0,
+                    matched=0,
+                    unmatched_manual=0,
+                    unmatched_ai=0
+                )
+            )
+
+        # Group manual tags by asset_id
+        asset_manual_tags: Dict[str, List[Dict]] = {}
+        for tag in manual_tags_data:
+            aid = tag["asset_id"]
+            if aid not in asset_manual_tags:
+                asset_manual_tags[aid] = []
+            asset_manual_tags[aid].append(tag)
+
+        asset_ids = list(asset_manual_tags.keys())[:request.limit]
+
+        # Get AI detections for these assets
+        ai_result = supabase.table("face_embeddings") \
+            .select("id, asset_id, bounding_box, cluster_id, face_thumbnail_url") \
+            .eq("user_id", user_id) \
+            .in_("asset_id", asset_ids) \
+            .not_.is_("bounding_box", "null") \
+            .execute()
+
+        ai_faces_data = ai_result.data or []
+
+        # Group AI faces by asset_id
+        asset_ai_faces: Dict[str, List[Dict]] = {}
+        for face in ai_faces_data:
+            aid = face["asset_id"]
+            if aid not in asset_ai_faces:
+                asset_ai_faces[aid] = []
+            asset_ai_faces[aid].append(face)
+
+        # Get asset thumbnails
+        assets_result = supabase.table("album_assets") \
+            .select("asset_id, thumbnail_uri") \
+            .in_("asset_id", asset_ids) \
+            .execute()
+
+        asset_thumbnails = {a["asset_id"]: a.get("thumbnail_uri") for a in (assets_result.data or [])}
+
+        # Build preview response
+        preview_assets = []
+        total_manual = 0
+        total_ai = 0
+        total_matched = 0
+
+        for asset_id in asset_ids:
+            manual_tags = asset_manual_tags.get(asset_id, [])
+            ai_faces = asset_ai_faces.get(asset_id, [])
+
+            # Build ManualTag objects
+            manual_tag_objs = []
+            for tag in manual_tags:
+                bbox = tag.get("bounding_box", {})
+                contact_info = tag.get("contacts", {})
+                manual_tag_objs.append(ManualTag(
+                    tag_id=tag["id"],
+                    contact_id=tag["contact_id"],
+                    contact_name=contact_info.get("display_name") if contact_info else None,
+                    bounding_box=BoundingBox(
+                        x=bbox.get("x", 0),
+                        y=bbox.get("y", 0),
+                        width=bbox.get("width", 0),
+                        height=bbox.get("height", 0)
+                    )
+                ))
+
+            # Build AIDetection objects
+            ai_detection_objs = []
+            for face in ai_faces:
+                bbox = face.get("bounding_box", {})
+                ai_detection_objs.append(AIDetection(
+                    face_id=face["id"],
+                    bounding_box=BoundingBox(
+                        x=bbox.get("x", 0),
+                        y=bbox.get("y", 0),
+                        width=bbox.get("width", 0),
+                        height=bbox.get("height", 0)
+                    ),
+                    cluster_id=face.get("cluster_id"),
+                    thumbnail_url=face.get("face_thumbnail_url")
+                ))
+
+            # Calculate matches using IoU
+            matches = []
+            matched_manual_ids = set()
+            matched_ai_ids = set()
+
+            for manual_tag in manual_tags:
+                best_match = None
+                best_iou = 0.0
+                manual_bbox = manual_tag.get("bounding_box", {})
+
+                for ai_face in ai_faces:
+                    if ai_face["id"] in matched_ai_ids:
+                        continue
+                    ai_bbox = ai_face.get("bounding_box", {})
+                    iou = calculate_iou(manual_bbox, ai_bbox)
+
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_match = ai_face
+
+                if best_match and best_iou >= request.iou_threshold:
+                    matches.append(TagMatch(
+                        manual_tag_id=manual_tag["id"],
+                        ai_face_id=best_match["id"],
+                        iou_score=round(best_iou, 3),
+                        status="matched"
+                    ))
+                    matched_manual_ids.add(manual_tag["id"])
+                    matched_ai_ids.add(best_match["id"])
+                    total_matched += 1
+                elif best_match and best_iou > 0.1:
+                    matches.append(TagMatch(
+                        manual_tag_id=manual_tag["id"],
+                        ai_face_id=best_match["id"],
+                        iou_score=round(best_iou, 3),
+                        status="low_confidence"
+                    ))
+
+            total_manual += len(manual_tags)
+            total_ai += len(ai_faces)
+
+            preview_assets.append(AssetTagPreview(
+                asset_id=asset_id,
+                thumbnail_url=asset_thumbnails.get(asset_id),
+                manual_tags=manual_tag_objs,
+                ai_detections=ai_detection_objs,
+                matches=matches
+            ))
+
+        return TagSyncPreviewResponse(
+            assets=preview_assets,
+            summary=TagSyncSummary(
+                total_assets=len(preview_assets),
+                total_manual_tags=total_manual,
+                total_ai_faces=total_ai,
+                matched=total_matched,
+                unmatched_manual=total_manual - total_matched,
+                unmatched_ai=total_ai - total_matched
+            )
+        )
+
+    except Exception as e:
+        logging.error(f"Tag sync preview failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/tag-sync/apply")
+async def apply_tag_sync(
+    request: ApplyTagSyncRequest,
+    user_id: str = Depends(get_current_user_id)
+):
+    """
+    Apply confirmed tag sync matches to link AI faces with Knox contacts.
+
+    This will update the knox_contact_id on matched face_embeddings.
+    """
+    from api.config import settings
+    from supabase import create_client
+    import logging
+
+    try:
+        supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
+
+        applied = 0
+        errors = []
+
+        for match in request.matches:
+            manual_tag_id = match.get("manual_tag_id")
+            ai_face_id = match.get("ai_face_id")
+
+            if not manual_tag_id or not ai_face_id:
+                continue
+
+            # Get the contact_id from the manual tag
+            tag_result = supabase.table("asset_tags") \
+                .select("contact_id") \
+                .eq("id", manual_tag_id) \
+                .eq("user_id", user_id) \
+                .single() \
+                .execute()
+
+            if not tag_result.data:
+                errors.append(f"Tag {manual_tag_id} not found")
+                continue
+
+            contact_id = tag_result.data["contact_id"]
+
+            # Update the face embedding with the knox_contact_id
+            update_result = supabase.table("face_embeddings") \
+                .update({"knox_contact_id": contact_id}) \
+                .eq("id", ai_face_id) \
+                .eq("user_id", user_id) \
+                .execute()
+
+            if update_result.data:
+                applied += 1
+            else:
+                errors.append(f"Failed to update face {ai_face_id}")
+
+        return {
+            "status": "completed",
+            "applied": applied,
+            "errors": errors if errors else None
+        }
+
+    except Exception as e:
+        logging.error(f"Apply tag sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

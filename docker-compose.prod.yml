@@ -12,14 +12,10 @@ services:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
-      - REDIS_URL=redis://redis:6379/0
       - MODEL_CACHE_DIR=/app/model_cache
       - DEBUG=false
     volumes:
       - model_cache:/app/model_cache
-    depends_on:
-      redis:
-        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -38,18 +34,14 @@ services:
     build:
       context: .
       dockerfile: api/Dockerfile
-    command: celery -A api.workers.celery_app worker --loglevel=info --concurrency=2
+    command: python run_worker.py --poll-interval 5
     environment:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
-      - REDIS_URL=redis://redis:6379/0
       - MODEL_CACHE_DIR=/app/model_cache
     volumes:
       - model_cache:/app/model_cache
-    depends_on:
-      redis:
-        condition: service_healthy
     restart: unless-stopped
     deploy:
       resources:
@@ -58,22 +50,6 @@ services:
         reservations:
           memory: 2G
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-
 volumes:
   model_cache:
-    driver: local
-  redis_data:
     driver: local

@@ -5,9 +5,8 @@ pydantic>=2.5.0
 pydantic-settings>=2.1.0
 httpx>=0.26.0
 
-# Supabase (includes realtime-py for WebSocket subscriptions)
+# Supabase (realtime is included in supabase package)
 supabase>=2.3.0
-realtime-py>=2.0.0  # For Supabase Realtime subscriptions
 
 # AI/ML Core
 torch>=2.1.0

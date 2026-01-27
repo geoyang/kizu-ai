@@ -27,6 +27,7 @@ class SearchResult(BaseModel):
     asset_id: str
     similarity: float  # Renamed from score for frontend compatibility
     description: Optional[str] = None
+    extracted_text: Optional[str] = None  # OCR-extracted text
     matched_faces: Optional[List[MatchedFace]] = None
     matched_objects: Optional[List[str]] = None
     matched_location: Optional[str] = None  # Location name from asset metadata
@@ -106,3 +107,52 @@ class ModelInfoResponse(BaseModel):
     vlm_model: Optional[str] = None
     device: str
     memory_used_mb: Optional[float] = None
+
+
+class ManualTag(BaseModel):
+    """A manual face tag from mobile app."""
+    tag_id: str
+    contact_id: str
+    contact_name: Optional[str] = None
+    bounding_box: BoundingBox
+
+
+class AIDetection(BaseModel):
+    """An AI-detected face."""
+    face_id: str
+    bounding_box: BoundingBox
+    cluster_id: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+
+
+class TagMatch(BaseModel):
+    """A match between manual tag and AI detection."""
+    manual_tag_id: str
+    ai_face_id: str
+    iou_score: float
+    status: str  # 'matched', 'low_confidence', 'no_match'
+
+
+class AssetTagPreview(BaseModel):
+    """Preview data for a single asset."""
+    asset_id: str
+    thumbnail_url: Optional[str] = None
+    manual_tags: List[ManualTag]
+    ai_detections: List[AIDetection]
+    matches: List[TagMatch]
+
+
+class TagSyncSummary(BaseModel):
+    """Summary statistics for tag sync preview."""
+    total_assets: int
+    total_manual_tags: int
+    total_ai_faces: int
+    matched: int
+    unmatched_manual: int
+    unmatched_ai: int
+
+
+class TagSyncPreviewResponse(BaseModel):
+    """Response for tag sync preview."""
+    assets: List[AssetTagPreview]
+    summary: TagSyncSummary

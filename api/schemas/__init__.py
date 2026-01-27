@@ -6,7 +6,10 @@ from .requests import (
     BatchProcessRequest,
     ClusterFacesRequest,
     AssignClusterRequest,
+    MergeClustersRequest,
     FaceSearchRequest,
+    TagSyncPreviewRequest,
+    ApplyTagSyncRequest,
 )
 from .responses import (
     SearchResponse,
@@ -14,6 +17,13 @@ from .responses import (
     ProcessingJobResponse,
     FaceClusterResponse,
     HealthResponse,
+    TagSyncPreviewResponse,
+    TagSyncSummary,
+    AssetTagPreview,
+    ManualTag,
+    AIDetection,
+    TagMatch,
+    BoundingBox,
 )
 
 __all__ = [
@@ -23,11 +33,21 @@ __all__ = [
     "BatchProcessRequest",
     "ClusterFacesRequest",
     "AssignClusterRequest",
+    "MergeClustersRequest",
     "FaceSearchRequest",
+    "TagSyncPreviewRequest",
+    "ApplyTagSyncRequest",
     # Responses
     "SearchResponse",
     "SearchResult",
     "ProcessingJobResponse",
     "FaceClusterResponse",
     "HealthResponse",
+    "TagSyncPreviewResponse",
+    "TagSyncSummary",
+    "AssetTagPreview",
+    "ManualTag",
+    "AIDetection",
+    "TagMatch",
+    "BoundingBox",
 ]

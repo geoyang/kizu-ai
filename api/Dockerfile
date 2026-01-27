@@ -31,6 +31,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY api/ ./api/
+COPY run_worker.py ./run_worker.py
 
 # Create model cache directory
 RUN mkdir -p /app/model_cache

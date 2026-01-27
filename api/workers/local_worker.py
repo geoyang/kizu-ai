@@ -1,13 +1,13 @@
-"""Local worker that pulls jobs from Supabase processing queue."""
+"""Local worker that pulls jobs from Supabase ai_processing_jobs table."""
 
 import asyncio
 import logging
 import signal
 import uuid
+from datetime import datetime
 from typing import Optional
 
 from supabase import create_client, Client
-from realtime.connection import Socket
 
 from api.config import settings
 from api.services.process_service import ProcessService
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 class LocalWorker:
     """
-    Pull-based worker that subscribes to Supabase Realtime
+    Pull-based worker that polls ai_processing_jobs table
     and processes images locally.
     """
 
@@ -99,26 +99,23 @@ class LocalWorker:
     async def _subscribe_realtime(self) -> None:
         """Subscribe to Supabase Realtime for instant job notifications."""
         try:
-            # Create realtime channel for processing_queue inserts
-            channel = self._client.channel('processing_queue_changes')
+            channel = self._client.channel('ai_processing_jobs_changes')
 
             def on_insert(payload):
                 """Handle new job inserted."""
                 logger.info(f"Realtime: New job detected: {payload}")
-                # Trigger immediate poll
                 asyncio.create_task(self._poll_and_process())
 
             channel.on_postgres_changes(
                 event='INSERT',
                 schema='public',
-                table='processing_queue',
+                table='ai_processing_jobs',
                 callback=on_insert
             )
 
             await channel.subscribe()
-            logger.info("Subscribed to Supabase Realtime for processing_queue")
+            logger.info("Subscribed to Supabase Realtime for ai_processing_jobs")
 
-            # Keep subscription alive
             while self._running:
                 await asyncio.sleep(1)
 
@@ -129,32 +126,44 @@ class LocalWorker:
     async def _poll_and_process(self) -> None:
         """Poll for a job and process it."""
         if self._current_job_id:
-            # Already processing a job
             return
 
         try:
-            # Claim a job using the atomic function
-            result = self._client.rpc(
-                'claim_processing_job',
-                {
-                    'p_worker_id': self._worker_id,
-                    'p_max_attempts': self._max_attempts
-                }
-            ).execute()
+            # Find oldest pending job
+            result = self._client.table('ai_processing_jobs').select(
+                '*'
+            ).eq(
+                'status', 'pending'
+            ).order(
+                'created_at', desc=False
+            ).limit(1).execute()
 
             if not result.data or len(result.data) == 0:
-                # No jobs available
                 return
 
             job = result.data[0]
+
+            # Claim the job by updating status to processing
+            from api.config import settings
+            update_result = self._client.table('ai_processing_jobs').update({
+                'status': 'processing',
+                'worker_id': self._worker_id,
+                'picked_up_at': datetime.utcnow().isoformat(),
+                'ai_version': settings.version,
+            }).eq('id', job['id']).eq('status', 'pending').execute()
+
+            if not update_result.data or len(update_result.data) == 0:
+                # Job was claimed by another worker
+                logger.debug(f"Job {job['id']} already claimed by another worker")
+                return
+
             self._current_job_id = job['id']
+            input_params = job.get('input_params') or {}
 
             logger.info(
-                f"Claimed job {job['id']} for asset {job['asset_id']} "
-                f"(attempt {job['attempts']})"
+                f"Claimed job {job['id']} for asset {input_params.get('asset_id')}"
             )
 
-            # Process the job
             await self._process_job(job)
 
         except Exception as e:
@@ -165,16 +174,22 @@ class LocalWorker:
     async def _process_job(self, job: dict) -> None:
         """Process a single job."""
         job_id = job['id']
-        asset_id = job['asset_id']
         user_id = job['user_id']
-        operations = job['operations']
+        input_params = job.get('input_params') or {}
+        asset_id = input_params.get('asset_id')
+        image_url = input_params.get('image_url')
+        operations = input_params.get('operations', ['embedding', 'faces', 'objects'])
 
         try:
-            # Load the image from Supabase storage
-            image = await self._load_asset_image(asset_id, user_id)
+            # Load image from URL or storage
+            image = None
+            if image_url:
+                image = await self._load_image_from_url(image_url)
+            if image is None and asset_id:
+                image = await self._load_asset_image(asset_id, user_id)
 
             if image is None:
-                raise ValueError(f"Could not load image for asset {asset_id}")
+                raise ValueError(f"Could not load image for job {job_id}")
 
             # Convert operation strings to enums
             ops = [
@@ -192,7 +207,7 @@ class LocalWorker:
 
             # Process the image
             result = await self._process_service.process_image(
-                asset_id=asset_id,
+                asset_id=asset_id or job_id,
                 image=image,
                 operations=ops,
                 user_id=user_id,
@@ -200,53 +215,100 @@ class LocalWorker:
                 worker_id=self._worker_id
             )
 
-            # Mark job as completed
-            self._client.rpc(
-                'complete_processing_job',
-                {
-                    'p_job_id': job_id,
-                    'p_result': result
+            # Add version info to result
+            from api.config import settings
+            result['_meta'] = {
+                'worker_id': self._worker_id,
+                'ai_version': settings.version,
+                'models': {
+                    'clip': settings.clip_model,
+                    'yolo': f"v8-{settings.yolo_size}",
+                    'face': settings.face_model_name,
+                    'vlm': settings.default_vlm,
                 }
-            ).execute()
+            }
+
+            # Mark job as completed
+            self._client.table('ai_processing_jobs').update({
+                'status': 'completed',
+                'progress': 100,
+                'processed': 1,
+                'result': result,
+                'completed_at': datetime.utcnow().isoformat(),
+            }).eq('id', job_id).execute()
 
             logger.info(f"Completed job {job_id} for asset {asset_id}")
 
         except Exception as e:
             logger.error(f"Job {job_id} failed: {e}")
 
+            # Truncate error message and remove HTML
+            error_msg = str(e)[:200]
+            if '<!DOCTYPE' in error_msg or '<html' in error_msg.lower():
+                error_msg = "Failed to load image: URL returned HTML instead of image"
+
             # Mark job as failed
-            self._client.rpc(
-                'fail_processing_job',
-                {
-                    'p_job_id': job_id,
-                    'p_error': str(e),
-                    'p_max_attempts': self._max_attempts
-                }
-            ).execute()
+            self._client.table('ai_processing_jobs').update({
+                'status': 'failed',
+                'error_message': error_msg,
+                'completed_at': datetime.utcnow().isoformat(),
+            }).eq('id', job_id).execute()
+
+    async def _load_image_from_url(self, url: str):
+        """Load image from URL."""
+        try:
+            import httpx
+            from PIL import Image
+            import io
+
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=30.0)
+                response.raise_for_status()
+
+                # Check content type is an image
+                content_type = response.headers.get('content-type', '')
+                if 'image' not in content_type.lower():
+                    logger.warning(f"URL returned non-image content-type: {content_type}")
+                    return None
+
+                image = Image.open(io.BytesIO(response.content))
+                return image
+
+        except Exception as e:
+            logger.warning(f"Failed to load image from URL: {e}")
+            return None
 
     async def _load_asset_image(self, asset_id: str, user_id: str):
         """Load image from Supabase storage."""
         try:
-            # Get asset record to find storage path
             result = self._client.table('assets').select(
-                'storage_path, bucket'
+                'path, web_uri, user_id'
             ).eq('id', asset_id).single().execute()
 
             if not result.data:
                 logger.error(f"Asset {asset_id} not found")
                 return None
 
-            storage_path = result.data.get('storage_path')
-            bucket = result.data.get('bucket', 'assets')
+            # Try web_uri first (public URL), then path (storage path)
+            web_uri = result.data.get('web_uri')
+            if web_uri:
+                image = await self._load_image_from_url(web_uri)
+                if image:
+                    return image
 
+            # Fall back to storage path
+            storage_path = result.data.get('path')
             if not storage_path:
-                logger.error(f"Asset {asset_id} has no storage_path")
+                logger.error(f"Asset {asset_id} has no path or web_uri")
                 return None
 
-            # Download from Supabase storage
+            # Determine bucket from path or use default
+            bucket = 'assets'
+            if storage_path.startswith('thumbnails/'):
+                bucket = 'thumbnails'
+
             file_data = self._client.storage.from_(bucket).download(storage_path)
 
-            # Load as PIL Image
             from PIL import Image
             import io
             image = Image.open(io.BytesIO(file_data))

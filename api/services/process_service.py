@@ -155,9 +155,10 @@ class ProcessService:
         user_id: str,
         objects: list
     ) -> None:
-        """Store detected objects to database."""
+        """Store detected objects to database and asset_tags."""
         from supabase import create_client
         from api.config import settings
+        import uuid
 
         supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
 
@@ -166,6 +167,12 @@ class ProcessService:
             supabase.table('detected_objects').delete().eq('asset_id', asset_id).execute()
         except Exception as e:
             logger.warning(f"Could not delete existing objects (table may not exist): {e}")
+
+        # Delete existing AI-generated object tags
+        try:
+            supabase.table('asset_tags').delete().eq('asset_id', asset_id).eq('tag_type', 'object').execute()
+        except Exception as e:
+            logger.warning(f"Could not delete existing object tags: {e}")
 
         # Insert new objects
         records = [
@@ -185,6 +192,26 @@ class ProcessService:
                 logger.info(f"Stored {len(records)} detected objects for {asset_id}")
             except Exception as e:
                 logger.warning(f"Could not store detected objects (table may not exist): {e}")
+
+        # Also add unique objects as asset_tags for UI display
+        unique_objects = list(set(obj["class"] for obj in objects))
+        tag_records = [
+            {
+                "id": str(uuid.uuid4()),
+                "asset_id": asset_id,
+                "tag_type": "object",
+                "tag_value": obj_class,
+                "created_by": "ai"
+            }
+            for obj_class in unique_objects
+        ]
+
+        if tag_records:
+            try:
+                supabase.table('asset_tags').insert(tag_records).execute()
+                logger.info(f"Added {len(tag_records)} object tags for {asset_id}")
+            except Exception as e:
+                logger.warning(f"Could not add object tags: {e}")
 
     async def _detect_faces(
         self,
@@ -221,6 +248,10 @@ class ProcessService:
                         }
                     )
 
+            # Add face tags to asset_tags (unnamed faces, can be matched later)
+            if result.faces:
+                await self._store_face_tags(asset_id, result.faces)
+
         return {
             "success": True,
             "count": len(result.faces),
@@ -234,6 +265,43 @@ class ProcessService:
                 for f in result.faces
             ]
         }
+
+    async def _store_face_tags(self, asset_id: str, faces: list) -> None:
+        """Store detected faces as asset_tags for UI display."""
+        from supabase import create_client
+        from api.config import settings
+        import uuid
+
+        supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
+
+        # Delete existing AI-generated face tags (only those created by AI, not user-assigned)
+        try:
+            supabase.table('asset_tags').delete().eq(
+                'asset_id', asset_id
+            ).eq('tag_type', 'person').eq('created_by', 'ai').execute()
+        except Exception as e:
+            logger.warning(f"Could not delete existing face tags: {e}")
+
+        # Add a tag for each detected face
+        tag_records = [
+            {
+                "id": str(uuid.uuid4()),
+                "asset_id": asset_id,
+                "tag_type": "person",
+                "tag_value": f"Unknown Person",
+                "face_index": face.face_index,
+                "bounding_box": face.bounding_box.to_dict() if face.bounding_box else None,
+                "created_by": "ai"
+            }
+            for face in faces
+        ]
+
+        if tag_records:
+            try:
+                supabase.table('asset_tags').insert(tag_records).execute()
+                logger.info(f"Added {len(tag_records)} face tags for {asset_id}")
+            except Exception as e:
+                logger.warning(f"Could not add face tags: {e}")
 
     async def _extract_and_upload_face_thumbnail(
         self,

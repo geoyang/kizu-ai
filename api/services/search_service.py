@@ -479,3 +479,297 @@ class SearchService:
             logger.error(f"Object search failed: {e}")
             elapsed_ms = (time.time() - start_time) * 1000
             return [], elapsed_ms
+
+    async def search_by_description(
+        self,
+        query: str,
+        user_id: str,
+        limit: int = 50
+    ) -> tuple[List[SearchResult], float]:
+        """
+        Search for images by AI-generated description text.
+
+        Uses ILIKE for fuzzy matching against image_descriptions table.
+
+        Returns:
+            Tuple of (results, processing_time_ms)
+        """
+        start_time = time.time()
+
+        logger.info(f"Description search: query='{query}', user_id={user_id}")
+
+        try:
+            from supabase import create_client
+            from api.config import settings
+
+            supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
+
+            # Search image_descriptions table with case-insensitive match
+            result = supabase.table('image_descriptions')\
+                .select('asset_id, description')\
+                .eq('user_id', user_id)\
+                .ilike('description', f'%{query}%')\
+                .limit(limit)\
+                .execute()
+
+            logger.info(f"Description search found {len(result.data)} matches")
+
+            # Get thumbnails for matched assets
+            asset_ids = [r['asset_id'] for r in result.data]
+            thumbnails = await self._get_thumbnails(asset_ids)
+
+            results = [
+                SearchResult(
+                    asset_id=r['asset_id'],
+                    similarity=1.0,  # Direct match
+                    thumbnail_url=thumbnails.get(r['asset_id']),
+                    description=r.get('description')
+                )
+                for r in result.data
+            ]
+
+            elapsed_ms = (time.time() - start_time) * 1000
+            return results, elapsed_ms
+
+        except Exception as e:
+            logger.error(f"Description search failed: {e}")
+            elapsed_ms = (time.time() - start_time) * 1000
+            return [], elapsed_ms
+
+    async def search_by_text(
+        self,
+        query: str,
+        user_id: str,
+        limit: int = 50
+    ) -> tuple[List[SearchResult], float]:
+        """
+        Search for images by OCR-extracted text.
+
+        Uses PostgreSQL full-text search with existing FTS index.
+
+        Returns:
+            Tuple of (results, processing_time_ms)
+        """
+        start_time = time.time()
+
+        logger.info(f"OCR text search: query='{query}', user_id={user_id}")
+
+        try:
+            from supabase import create_client
+            from api.config import settings
+
+            supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
+
+            # Use textSearch for full-text search on extracted_text column
+            # Falls back to ILIKE if FTS index doesn't exist
+            result = supabase.table('image_text')\
+                .select('asset_id, extracted_text')\
+                .eq('user_id', user_id)\
+                .ilike('extracted_text', f'%{query}%')\
+                .limit(limit)\
+                .execute()
+
+            logger.info(f"OCR text search found {len(result.data)} matches")
+
+            # Get thumbnails for matched assets
+            asset_ids = [r['asset_id'] for r in result.data]
+            thumbnails = await self._get_thumbnails(asset_ids)
+
+            results = [
+                SearchResult(
+                    asset_id=r['asset_id'],
+                    similarity=1.0,  # Direct match
+                    thumbnail_url=thumbnails.get(r['asset_id']),
+                    extracted_text=r.get('extracted_text')
+                )
+                for r in result.data
+            ]
+
+            elapsed_ms = (time.time() - start_time) * 1000
+            return results, elapsed_ms
+
+        except Exception as e:
+            logger.error(f"OCR text search failed: {e}")
+            elapsed_ms = (time.time() - start_time) * 1000
+            return [], elapsed_ms
+
+    async def combined_search(
+        self,
+        user_id: str,
+        query: Optional[str] = None,
+        filters: Optional['SearchFilters'] = None,
+        limit: int = 50,
+        threshold: float = 0.2
+    ) -> tuple[List[SearchResult], float, dict]:
+        """
+        Perform a combined search with multiple filters.
+
+        Supports:
+        - Semantic query (CLIP embeddings)
+        - Date range filter
+        - People filter (contact/cluster IDs)
+        - Object class filter
+        - Description text search
+        - OCR text search
+
+        Returns:
+            Tuple of (results, processing_time_ms, metadata)
+        """
+        start_time = time.time()
+        from api.schemas.requests import SearchFilters
+
+        logger.info(f"Combined search: query='{query}', filters={filters}")
+
+        if not query and not filters:
+            return [], 0, {"error": "Query or filters required"}
+
+        try:
+            from supabase import create_client
+            from api.config import settings
+
+            supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
+
+            # Start with all asset IDs from various search methods
+            candidate_sets = []
+
+            # 1. Semantic search (if query provided)
+            if query:
+                from api.schemas.requests import SearchRequest
+                request = SearchRequest(
+                    query=query,
+                    limit=limit * 4,  # Over-fetch for filtering
+                    threshold=threshold
+                )
+                semantic_results, _, _ = await self.search(request, user_id)
+                if semantic_results:
+                    candidate_sets.append({
+                        r.asset_id: r.similarity
+                        for r in semantic_results
+                    })
+
+            # 2. Description search (if description_query in filters)
+            if filters and filters.description_query:
+                desc_results, _ = await self.search_by_description(
+                    filters.description_query, user_id, limit * 2
+                )
+                if desc_results:
+                    candidate_sets.append({
+                        r.asset_id: 0.9  # High score for text match
+                        for r in desc_results
+                    })
+
+            # 3. OCR text search (if text_query in filters)
+            if filters and filters.text_query:
+                ocr_results, _ = await self.search_by_text(
+                    filters.text_query, user_id, limit * 2
+                )
+                if ocr_results:
+                    candidate_sets.append({
+                        r.asset_id: 0.9  # High score for text match
+                        for r in ocr_results
+                    })
+
+            # 4. Object class filter
+            if filters and filters.object_classes:
+                for obj_class in filters.object_classes:
+                    obj_results, _ = await self.search_by_object(
+                        obj_class, user_id, min_confidence=0.5, limit=limit * 2
+                    )
+                    if obj_results:
+                        candidate_sets.append({
+                            r.asset_id: r.similarity
+                            for r in obj_results
+                        })
+
+            # 5. People filter (face search)
+            if filters and filters.people:
+                for person_id in filters.people:
+                    face_embedding = await self.get_face_embedding(
+                        contact_id=person_id,
+                        cluster_id=person_id
+                    )
+                    if face_embedding:
+                        face_results = await self.search_by_face(
+                            face_embedding, user_id, limit=limit * 2
+                        )
+                        if face_results:
+                            candidate_sets.append({
+                                r.asset_id: r.similarity
+                                for r in face_results
+                            })
+
+            # Intersect or union candidate sets
+            if not candidate_sets:
+                return [], (time.time() - start_time) * 1000, {}
+
+            # If multiple sets, find intersection (AND logic)
+            if len(candidate_sets) > 1:
+                final_candidates = set(candidate_sets[0].keys())
+                for cs in candidate_sets[1:]:
+                    final_candidates &= set(cs.keys())
+
+                # Average scores for intersected results
+                scored_candidates = {}
+                for asset_id in final_candidates:
+                    scores = [cs.get(asset_id, 0) for cs in candidate_sets]
+                    scored_candidates[asset_id] = sum(scores) / len(scores)
+            else:
+                scored_candidates = candidate_sets[0]
+
+            # Apply date filters if provided
+            if filters and (filters.date_start or filters.date_end):
+                from datetime import datetime
+                asset_ids = list(scored_candidates.keys())
+                if asset_ids:
+                    assets_result = supabase.table('assets')\
+                        .select('id, created_at')\
+                        .in_('id', asset_ids)\
+                        .execute()
+
+                    for row in assets_result.data:
+                        created_at = row.get('created_at')
+                        if created_at:
+                            try:
+                                asset_date = datetime.fromisoformat(
+                                    created_at.replace('Z', '+00:00')
+                                ).replace(tzinfo=None).date()
+
+                                if filters.date_start and asset_date < filters.date_start:
+                                    scored_candidates.pop(row['id'], None)
+                                if filters.date_end and asset_date > filters.date_end:
+                                    scored_candidates.pop(row['id'], None)
+                            except ValueError:
+                                pass
+
+            # Sort by score and limit
+            sorted_candidates = sorted(
+                scored_candidates.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:limit]
+
+            # Get thumbnails
+            asset_ids = [aid for aid, _ in sorted_candidates]
+            thumbnails = await self._get_thumbnails(asset_ids)
+
+            results = [
+                SearchResult(
+                    asset_id=asset_id,
+                    similarity=score,
+                    thumbnail_url=thumbnails.get(asset_id)
+                )
+                for asset_id, score in sorted_candidates
+            ]
+
+            elapsed_ms = (time.time() - start_time) * 1000
+            metadata = {
+                "filter_sets": len(candidate_sets),
+                "candidates_before_date_filter": len(scored_candidates),
+            }
+
+            return results, elapsed_ms, metadata
+
+        except Exception as e:
+            logger.error(f"Combined search failed: {e}")
+            elapsed_ms = (time.time() - start_time) * 1000
+            return [], elapsed_ms, {"error": str(e)}
