@@ -137,6 +137,9 @@ class AssetTagPreview(BaseModel):
     """Preview data for a single asset."""
     asset_id: str
     thumbnail_url: Optional[str] = None
+    image_width: Optional[int] = None
+    image_height: Optional[int] = None
+    metadata: Optional[Dict[str, Any]] = None
     manual_tags: List[ManualTag]
     ai_detections: List[AIDetection]
     matches: List[TagMatch]

@@ -554,183 +554,113 @@ async def preview_tag_sync(
     """
     Preview manual tag to AI detection bounding box matching.
 
-    Compares manual face tags from the mobile app with AI-detected faces
-    using IoU (Intersection over Union) to find matches.
+    Calls the tag-sync-api edge function which handles the database queries.
+
+    **Matching Algorithm:**
+    - For each manual tag, finds the AI detection with highest IoU overlap
+    - IoU >= threshold (default 0.3): marked as "matched"
+    - IoU between 0.1 and threshold: marked as "low_confidence"
+    - IoU < 0.1: no match recorded
+
+    **Response includes:**
+    - Per-asset breakdown with bounding boxes for visualization
+    - Summary statistics (total tags, detections, matched, unmatched)
     """
     from api.config import settings
-    from supabase import create_client
+    import httpx
     import logging
 
     try:
-        supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
+        # Call the edge function instead of direct DB access
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{settings.supabase_url}/functions/v1/tag-sync-api/preview",
+                headers={
+                    "Authorization": f"Bearer {settings.supabase_service_role_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "user_id": user_id,
+                    "asset_ids": request.asset_ids,
+                    "iou_threshold": request.iou_threshold,
+                    "limit": request.limit,
+                },
+                timeout=30.0
+            )
 
-        # Get assets with manual tags
-        tags_query = supabase.table("asset_tags") \
-            .select("id, asset_id, contact_id, bounding_box, contacts!inner(id, display_name)") \
-            .eq("user_id", user_id) \
-            .not_.is_("bounding_box", "null")
+            logging.info(f"Edge function response status: {response.status_code}")
 
-        if request.asset_ids:
-            tags_query = tags_query.in_("asset_id", request.asset_ids)
+            if response.status_code != 200:
+                error_detail = response.text
+                logging.error(f"Edge function error: {error_detail}")
+                raise HTTPException(status_code=response.status_code, detail=error_detail)
 
-        tags_result = tags_query.limit(request.limit * 10).execute()
-        manual_tags_data = tags_result.data or []
+            try:
+                data = response.json()
+                logging.info(f"Edge function returned {len(data.get('assets', []))} assets")
+            except Exception as parse_err:
+                logging.error(f"Failed to parse edge function response: {parse_err}")
+                logging.error(f"Response text: {response.text[:500]}")
+                raise
 
-        if not manual_tags_data:
+            # Convert response to pydantic models
+            assets = []
+            for asset in data.get("assets", []):
+                manual_tags = [
+                    ManualTag(
+                        tag_id=t["tag_id"],
+                        contact_id=t["contact_id"],
+                        contact_name=t.get("contact_name"),
+                        bounding_box=BoundingBox(**t["bounding_box"]) if t.get("bounding_box") else BoundingBox(x=0, y=0, width=0, height=0)
+                    ) for t in asset.get("manual_tags", [])
+                ]
+                ai_detections = [
+                    AIDetection(
+                        face_id=d["face_id"],
+                        bounding_box=BoundingBox(**d["bounding_box"]) if d.get("bounding_box") else BoundingBox(x=0, y=0, width=0, height=0),
+                        cluster_id=d.get("cluster_id"),
+                        thumbnail_url=d.get("thumbnail_url")
+                    ) for d in asset.get("ai_detections", [])
+                ]
+                matches = [
+                    TagMatch(
+                        manual_tag_id=m["manual_tag_id"],
+                        ai_face_id=m["ai_face_id"],
+                        iou_score=m["iou_score"],
+                        status=m["status"]
+                    ) for m in asset.get("matches", [])
+                ]
+                assets.append(AssetTagPreview(
+                    asset_id=asset["asset_id"],
+                    thumbnail_url=asset.get("thumbnail_url"),
+                    image_width=asset.get("image_width"),
+                    image_height=asset.get("image_height"),
+                    metadata=asset.get("metadata"),
+                    manual_tags=manual_tags,
+                    ai_detections=ai_detections,
+                    matches=matches
+                ))
+
+            summary = data.get("summary", {})
             return TagSyncPreviewResponse(
-                assets=[],
+                assets=assets,
                 summary=TagSyncSummary(
-                    total_assets=0,
-                    total_manual_tags=0,
-                    total_ai_faces=0,
-                    matched=0,
-                    unmatched_manual=0,
-                    unmatched_ai=0
+                    total_assets=summary.get("total_assets", 0),
+                    total_manual_tags=summary.get("total_manual_tags", 0),
+                    total_ai_faces=summary.get("total_ai_faces", 0),
+                    matched=summary.get("matched", 0),
+                    unmatched_manual=summary.get("unmatched_manual", 0),
+                    unmatched_ai=summary.get("unmatched_ai", 0)
                 )
             )
 
-        # Group manual tags by asset_id
-        asset_manual_tags: Dict[str, List[Dict]] = {}
-        for tag in manual_tags_data:
-            aid = tag["asset_id"]
-            if aid not in asset_manual_tags:
-                asset_manual_tags[aid] = []
-            asset_manual_tags[aid].append(tag)
-
-        asset_ids = list(asset_manual_tags.keys())[:request.limit]
-
-        # Get AI detections for these assets
-        ai_result = supabase.table("face_embeddings") \
-            .select("id, asset_id, bounding_box, cluster_id, face_thumbnail_url") \
-            .eq("user_id", user_id) \
-            .in_("asset_id", asset_ids) \
-            .not_.is_("bounding_box", "null") \
-            .execute()
-
-        ai_faces_data = ai_result.data or []
-
-        # Group AI faces by asset_id
-        asset_ai_faces: Dict[str, List[Dict]] = {}
-        for face in ai_faces_data:
-            aid = face["asset_id"]
-            if aid not in asset_ai_faces:
-                asset_ai_faces[aid] = []
-            asset_ai_faces[aid].append(face)
-
-        # Get asset thumbnails
-        assets_result = supabase.table("album_assets") \
-            .select("asset_id, thumbnail_uri") \
-            .in_("asset_id", asset_ids) \
-            .execute()
-
-        asset_thumbnails = {a["asset_id"]: a.get("thumbnail_uri") for a in (assets_result.data or [])}
-
-        # Build preview response
-        preview_assets = []
-        total_manual = 0
-        total_ai = 0
-        total_matched = 0
-
-        for asset_id in asset_ids:
-            manual_tags = asset_manual_tags.get(asset_id, [])
-            ai_faces = asset_ai_faces.get(asset_id, [])
-
-            # Build ManualTag objects
-            manual_tag_objs = []
-            for tag in manual_tags:
-                bbox = tag.get("bounding_box", {})
-                contact_info = tag.get("contacts", {})
-                manual_tag_objs.append(ManualTag(
-                    tag_id=tag["id"],
-                    contact_id=tag["contact_id"],
-                    contact_name=contact_info.get("display_name") if contact_info else None,
-                    bounding_box=BoundingBox(
-                        x=bbox.get("x", 0),
-                        y=bbox.get("y", 0),
-                        width=bbox.get("width", 0),
-                        height=bbox.get("height", 0)
-                    )
-                ))
-
-            # Build AIDetection objects
-            ai_detection_objs = []
-            for face in ai_faces:
-                bbox = face.get("bounding_box", {})
-                ai_detection_objs.append(AIDetection(
-                    face_id=face["id"],
-                    bounding_box=BoundingBox(
-                        x=bbox.get("x", 0),
-                        y=bbox.get("y", 0),
-                        width=bbox.get("width", 0),
-                        height=bbox.get("height", 0)
-                    ),
-                    cluster_id=face.get("cluster_id"),
-                    thumbnail_url=face.get("face_thumbnail_url")
-                ))
-
-            # Calculate matches using IoU
-            matches = []
-            matched_manual_ids = set()
-            matched_ai_ids = set()
-
-            for manual_tag in manual_tags:
-                best_match = None
-                best_iou = 0.0
-                manual_bbox = manual_tag.get("bounding_box", {})
-
-                for ai_face in ai_faces:
-                    if ai_face["id"] in matched_ai_ids:
-                        continue
-                    ai_bbox = ai_face.get("bounding_box", {})
-                    iou = calculate_iou(manual_bbox, ai_bbox)
-
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_match = ai_face
-
-                if best_match and best_iou >= request.iou_threshold:
-                    matches.append(TagMatch(
-                        manual_tag_id=manual_tag["id"],
-                        ai_face_id=best_match["id"],
-                        iou_score=round(best_iou, 3),
-                        status="matched"
-                    ))
-                    matched_manual_ids.add(manual_tag["id"])
-                    matched_ai_ids.add(best_match["id"])
-                    total_matched += 1
-                elif best_match and best_iou > 0.1:
-                    matches.append(TagMatch(
-                        manual_tag_id=manual_tag["id"],
-                        ai_face_id=best_match["id"],
-                        iou_score=round(best_iou, 3),
-                        status="low_confidence"
-                    ))
-
-            total_manual += len(manual_tags)
-            total_ai += len(ai_faces)
-
-            preview_assets.append(AssetTagPreview(
-                asset_id=asset_id,
-                thumbnail_url=asset_thumbnails.get(asset_id),
-                manual_tags=manual_tag_objs,
-                ai_detections=ai_detection_objs,
-                matches=matches
-            ))
-
-        return TagSyncPreviewResponse(
-            assets=preview_assets,
-            summary=TagSyncSummary(
-                total_assets=len(preview_assets),
-                total_manual_tags=total_manual,
-                total_ai_faces=total_ai,
-                matched=total_matched,
-                unmatched_manual=total_manual - total_matched,
-                unmatched_ai=total_ai - total_matched
-            )
-        )
-
+    except httpx.RequestError as e:
+        logging.error(f"Tag sync preview request failed: {e}")
+        raise HTTPException(status_code=503, detail=f"Edge function unavailable: {str(e)}")
     except Exception as e:
+        import traceback
         logging.error(f"Tag sync preview failed: {e}")
+        logging.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -742,57 +672,42 @@ async def apply_tag_sync(
     """
     Apply confirmed tag sync matches to link AI faces with Knox contacts.
 
-    This will update the knox_contact_id on matched face_embeddings.
+    Calls the tag-sync-api edge function which handles the database updates.
+
+    **What this does:**
+    - For each confirmed match, links the AI face to the Knox contact
+    - Updates `face_embeddings.knox_contact_id` for future recognition
+
+    **Input:**
+    - List of {manual_tag_id, ai_face_id} pairs from the preview step
     """
     from api.config import settings
-    from supabase import create_client
+    import httpx
     import logging
 
     try:
-        supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
+        # Call the edge function instead of direct DB access
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{settings.supabase_url}/functions/v1/tag-sync-api/apply",
+                headers={
+                    "Authorization": f"Bearer {settings.supabase_service_role_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"user_id": user_id, "matches": request.matches},
+                timeout=30.0
+            )
 
-        applied = 0
-        errors = []
+            if response.status_code != 200:
+                error_detail = response.text
+                logging.error(f"Edge function error: {error_detail}")
+                raise HTTPException(status_code=response.status_code, detail=error_detail)
 
-        for match in request.matches:
-            manual_tag_id = match.get("manual_tag_id")
-            ai_face_id = match.get("ai_face_id")
+            return response.json()
 
-            if not manual_tag_id or not ai_face_id:
-                continue
-
-            # Get the contact_id from the manual tag
-            tag_result = supabase.table("asset_tags") \
-                .select("contact_id") \
-                .eq("id", manual_tag_id) \
-                .eq("user_id", user_id) \
-                .single() \
-                .execute()
-
-            if not tag_result.data:
-                errors.append(f"Tag {manual_tag_id} not found")
-                continue
-
-            contact_id = tag_result.data["contact_id"]
-
-            # Update the face embedding with the knox_contact_id
-            update_result = supabase.table("face_embeddings") \
-                .update({"knox_contact_id": contact_id}) \
-                .eq("id", ai_face_id) \
-                .eq("user_id", user_id) \
-                .execute()
-
-            if update_result.data:
-                applied += 1
-            else:
-                errors.append(f"Failed to update face {ai_face_id}")
-
-        return {
-            "status": "completed",
-            "applied": applied,
-            "errors": errors if errors else None
-        }
-
+    except httpx.RequestError as e:
+        logging.error(f"Tag sync apply request failed: {e}")
+        raise HTTPException(status_code=503, detail=f"Edge function unavailable: {str(e)}")
     except Exception as e:
         logging.error(f"Apply tag sync failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
