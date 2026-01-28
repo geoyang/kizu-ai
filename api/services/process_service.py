@@ -4,7 +4,7 @@ import io
 import logging
 import uuid
 from typing import List, Optional, Set
-from PIL import Image
+from PIL import Image, ImageOps
 
 from api.core import ModelRegistry
 from api.core.registry import ModelType
@@ -41,6 +41,11 @@ class ProcessService:
 
         Returns dict with results for each operation.
         """
+        # Apply EXIF orientation before any processing - phone photos
+        # are often stored rotated with an EXIF tag, which causes face
+        # detection to fail on sideways/upside-down images
+        image = ImageOps.exif_transpose(image)
+
         results = {"asset_id": asset_id}
         ops = self._expand_operations(operations)
 
@@ -314,14 +319,11 @@ class ProcessService:
         thumbnail_size: int = 150
     ) -> Optional[str]:
         """Extract face crop from image and upload to storage."""
-        from PIL import ImageOps
         try:
             if not bounding_box:
                 return None
 
-            # Apply EXIF orientation if not already applied
-            image = ImageOps.exif_transpose(image)
-
+            # EXIF orientation is already applied in process_image()
             # Get bounding box coordinates
             x = bounding_box.x
             y = bounding_box.y

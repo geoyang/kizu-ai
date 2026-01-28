@@ -51,7 +51,7 @@ class InsightFaceModel(BaseFaceModel):
             root=self._cache_dir,
             providers=['CPUExecutionProvider']  # Works on M1 and AMD
         )
-        self._app.prepare(ctx_id=0, det_size=(640, 640))
+        self._app.prepare(ctx_id=0, det_size=(1280, 1280))
 
         logger.info(f"Loaded {self._model_name}")
 

@@ -126,9 +126,82 @@ async def process_batch_task(
     process_service: ProcessService
 ):
     """Background task for batch processing."""
-    # This would be handled by Celery in production
-    # Placeholder for FastAPI BackgroundTasks demo
-    pass
+    import logging
+    from supabase import create_client
+    from api.config import settings
+    from api.routers.jobs import create_job, update_job
+
+    logger = logging.getLogger(__name__)
+    supabase = create_client(
+        settings.supabase_url, settings.supabase_service_role_key
+    )
+
+    # Resolve asset list
+    asset_ids = request.asset_ids
+    if not asset_ids:
+        result = supabase.table('assets') \
+            .select('id') \
+            .eq('user_id', user_id) \
+            .limit(request.limit or 100) \
+            .execute()
+        asset_ids = [a['id'] for a in (result.data or [])]
+
+    total = len(asset_ids)
+    create_job(job_id, user_id, "batch", total=total)
+    update_job(job_id, status="processing")
+
+    if not asset_ids:
+        update_job(job_id, status="completed", progress=100)
+        return
+
+    # Fetch web_uri for all assets
+    uri_result = supabase.table('assets') \
+        .select('id, web_uri') \
+        .in_('id', asset_ids) \
+        .execute()
+    uri_map = {a['id']: a.get('web_uri') for a in (uri_result.data or [])}
+
+    processed = 0
+    errors = 0
+
+    for asset_id in asset_ids:
+        try:
+            image_url = uri_map.get(asset_id)
+            if not image_url:
+                logger.warning(f"[batch] No web_uri for {asset_id}")
+                errors += 1
+                continue
+
+            image = load_image(image_url)
+
+            await process_service.process_image(
+                asset_id=asset_id,
+                image=image,
+                operations=request.operations,
+                user_id=user_id,
+                store_results=True,
+                force_reprocess=request.force_reprocess,
+                worker_id=f"batch-{job_id[:8]}"
+            )
+            processed += 1
+
+        except Exception as e:
+            logger.error(f"[batch] Failed {asset_id}: {e}")
+            errors += 1
+
+        progress = int(((processed + errors) / total) * 100)
+        update_job(job_id, processed=processed, progress=progress)
+
+    update_job(
+        job_id,
+        status="completed",
+        progress=100,
+        processed=processed,
+    )
+    logger.info(
+        f"[batch] Job {job_id[:8]} done: {processed}/{total} "
+        f"processed, {errors} errors"
+    )
 
 
 @router.post("/webhook")

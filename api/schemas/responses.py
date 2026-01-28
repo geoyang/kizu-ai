@@ -133,6 +133,15 @@ class TagMatch(BaseModel):
     status: str  # 'matched', 'low_confidence', 'no_match'
 
 
+class DetectedObjectInfo(BaseModel):
+    """A detected object from YOLO."""
+    id: str
+    object_class: str
+    confidence: float
+    bounding_box: Optional[Dict[str, Any]] = None
+    model_version: Optional[str] = None
+
+
 class AssetTagPreview(BaseModel):
     """Preview data for a single asset."""
     asset_id: str
@@ -142,6 +151,7 @@ class AssetTagPreview(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     manual_tags: List[ManualTag]
     ai_detections: List[AIDetection]
+    detected_objects: Optional[List[DetectedObjectInfo]] = None
     matches: List[TagMatch]
 
 

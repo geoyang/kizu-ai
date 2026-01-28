@@ -23,6 +23,7 @@ from api.schemas.responses import (
     AIDetection,
     TagMatch,
     BoundingBox,
+    DetectedObjectInfo,
 )
 from api.services import FaceService, ClusteringService
 from api.dependencies import (
@@ -630,6 +631,15 @@ async def preview_tag_sync(
                         status=m["status"]
                     ) for m in asset.get("matches", [])
                 ]
+                detected_objects = [
+                    DetectedObjectInfo(
+                        id=o["id"],
+                        object_class=o["object_class"],
+                        confidence=o["confidence"],
+                        bounding_box=o.get("bounding_box"),
+                        model_version=o.get("model_version")
+                    ) for o in asset.get("detected_objects", [])
+                ] if asset.get("detected_objects") else None
                 assets.append(AssetTagPreview(
                     asset_id=asset["asset_id"],
                     thumbnail_url=asset.get("thumbnail_url"),
@@ -638,6 +648,7 @@ async def preview_tag_sync(
                     metadata=asset.get("metadata"),
                     manual_tags=manual_tags,
                     ai_detections=ai_detections,
+                    detected_objects=detected_objects,
                     matches=matches
                 ))
 
