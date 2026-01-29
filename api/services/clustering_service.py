@@ -45,17 +45,32 @@ class ClusteringService:
         self,
         user_id: str,
         threshold: float = 0.6,
-        min_cluster_size: int = 2
+        min_cluster_size: int = 2,
+        on_progress=None
     ) -> ClusterResult:
         """
         Cluster all face embeddings for a user.
 
         Uses HDBSCAN for density-based clustering.
+        on_progress(stage, detail, progress, **kwargs) is called at each step.
         """
+        def report(stage, detail, progress, **kwargs):
+            logger.info(f"[cluster] {stage}: {detail}")
+            if on_progress:
+                on_progress(stage, detail, progress, **kwargs)
+
         # 1. Get all face embeddings for user
+        report("Fetching", "Loading face embeddings...", 10)
         embeddings, face_ids = await self._get_all_face_embeddings(user_id)
+        report(
+            "Fetching",
+            f"Found {len(embeddings)} face embeddings",
+            15,
+            total=len(embeddings)
+        )
 
         if len(embeddings) < min_cluster_size:
+            report("Done", f"Only {len(embeddings)} faces found, need at least {min_cluster_size}", 100)
             return ClusterResult(
                 num_clusters=0,
                 num_faces_clustered=0,
@@ -63,23 +78,37 @@ class ClusteringService:
             )
 
         # 2. Auto-label faces from manual asset_tags (skips Apply step)
+        report("Auto-label", "Matching faces to manual tags...", 20)
         auto_labeled = await self._auto_label_from_tags(user_id)
-        if auto_labeled > 0:
-            logger.info(f"Auto-labeled {auto_labeled} faces from manual tags")
+        report("Auto-label", f"Labeled {auto_labeled} faces from manual tags", 30)
 
         # 3. Run clustering
+        report(
+            "Clustering",
+            f"Running HDBSCAN on {len(embeddings)} embeddings "
+            f"(threshold={threshold}, min_size={min_cluster_size})...",
+            40
+        )
         labels = self._run_clustering(
             embeddings,
             threshold,
             min_cluster_size
         )
 
-        # 4. Save cluster assignments
-        await self._save_clusters(user_id, face_ids, labels)
-
-        # 5. Return stats
         num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
         num_noise = sum(1 for l in labels if l == -1)
+        report(
+            "Clustering",
+            f"Produced {num_clusters} clusters, "
+            f"{len(labels) - num_noise} clustered, {num_noise} noise",
+            60,
+            processed=num_clusters
+        )
+
+        # 4. Save cluster assignments
+        report("Saving", f"Saving {num_clusters} clusters to database...", 70)
+        await self._save_clusters(user_id, face_ids, labels)
+        report("Saving", f"Saved {num_clusters} clusters", 95, processed=num_clusters)
 
         return ClusterResult(
             num_clusters=num_clusters,
@@ -91,23 +120,41 @@ class ClusteringService:
         self,
         user_id: str
     ) -> Tuple[np.ndarray, List[str]]:
-        """Get all face embeddings for a user."""
+        """Get all face embeddings for a user.
+
+        Paginates through Supabase to fetch all rows (default limit is 1000).
+        """
         await self._store.connect()
 
         try:
-            result = self._store._client.table("face_embeddings") \
-                .select("id, embedding") \
-                .eq("user_id", user_id) \
-                .execute()
+            all_rows = []
+            page_size = 1000
+            offset = 0
 
-            if not result.data:
+            while True:
+                result = self._store._client.table("face_embeddings") \
+                    .select("id, embedding") \
+                    .eq("user_id", user_id) \
+                    .range(offset, offset + page_size - 1) \
+                    .execute()
+
+                if not result.data:
+                    break
+
+                all_rows.extend(result.data)
+
+                if len(result.data) < page_size:
+                    break
+                offset += page_size
+
+            if not all_rows:
                 logger.info(f"No face embeddings found for user {user_id}")
                 return np.array([]), []
 
             embeddings = []
             face_ids = []
 
-            for row in result.data:
+            for row in all_rows:
                 embedding_data = row.get("embedding")
                 if embedding_data:
                     parsed = parse_pgvector(embedding_data)
@@ -143,6 +190,14 @@ class ClusteringService:
             )
 
             labels = clusterer.fit_predict(embeddings)
+
+            num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+            logger.info(
+                f"HDBSCAN produced {num_clusters} clusters from "
+                f"{len(embeddings)} embeddings (threshold={threshold}, "
+                f"epsilon={min_cluster_dist:.2f})"
+            )
+
             return labels.tolist()
 
         except ImportError:
@@ -410,27 +465,42 @@ class ClusteringService:
         await self._store.connect()
 
         try:
-            result = self._store._client.table("face_clusters") \
-                .select("*") \
-                .eq("user_id", user_id) \
-                .order("face_count", desc=True) \
-                .execute()
+            # Paginate to fetch all clusters (Supabase defaults to 1000 rows)
+            all_rows = []
+            page_size = 1000
+            offset = 0
 
-            if not result.data:
+            while True:
+                result = self._store._client.table("face_clusters") \
+                    .select("*") \
+                    .eq("user_id", user_id) \
+                    .order("face_count", desc=True) \
+                    .range(offset, offset + page_size - 1) \
+                    .execute()
+
+                if not result.data:
+                    break
+                all_rows.extend(result.data)
+                if len(result.data) < page_size:
+                    break
+                offset += page_size
+
+            if not all_rows:
                 logger.info(f"No clusters found for user {user_id}")
                 return []
 
-            clusters = []
-            for row in result.data:
-                # Get sample faces for this cluster
-                sample_faces = await self._get_sample_faces(row["id"], limit=4)
+            # Batch-fetch one sample face per cluster using a single query
+            cluster_ids = [row["id"] for row in all_rows]
+            sample_faces_map = await self._get_sample_faces_batch(cluster_ids)
 
+            clusters = []
+            for row in all_rows:
                 cluster = FaceClusterResponse(
                     cluster_id=row["id"],
                     name=row.get("name"),
                     contact_id=row.get("contact_id"),
                     face_count=row.get("face_count", 0),
-                    sample_faces=sample_faces
+                    sample_faces=sample_faces_map.get(row["id"], [])
                 )
                 clusters.append(cluster)
 
@@ -440,6 +510,113 @@ class ClusteringService:
         except Exception as e:
             logger.error(f"Failed to get clusters: {e}")
             return []
+
+    async def _get_sample_faces_batch(
+        self,
+        cluster_ids: List[str]
+    ) -> dict:
+        """Get one sample face per cluster in bulk.
+
+        Returns {cluster_id: [SampleFace, ...]} with one face each.
+        Uses representative_face_id from face_embeddings in a single query.
+        """
+        if not cluster_ids:
+            return {}
+
+        try:
+            # Fetch representative faces for all clusters in one paginated query
+            all_faces = []
+            page_size = 1000
+            offset = 0
+
+            while True:
+                batch = cluster_ids[offset:offset + page_size]
+                if not batch:
+                    break
+
+                result = self._store._client.table("face_embeddings") \
+                    .select("cluster_id, asset_id, face_index, face_thumbnail_url, is_from_video") \
+                    .in_("cluster_id", batch) \
+                    .execute()
+
+                if result.data:
+                    all_faces.extend(result.data)
+
+                if len(batch) < page_size:
+                    break
+                offset += page_size
+
+            # Group by cluster, keep first face per cluster
+            # (prefer faces with thumbnails)
+            faces_by_cluster: dict = {}
+            for row in all_faces:
+                cid = row["cluster_id"]
+                if cid not in faces_by_cluster:
+                    faces_by_cluster[cid] = []
+                faces_by_cluster[cid].append(row)
+
+            result_map = {}
+            # Collect asset_ids that need fallback thumbnails
+            needs_fallback: list = []
+            for cid, faces in faces_by_cluster.items():
+                # Pick first face with a thumbnail, or first face
+                best = next(
+                    (f for f in faces if f.get("face_thumbnail_url")),
+                    faces[0] if faces else None
+                )
+                if best:
+                    result_map[cid] = {
+                        "asset_id": best["asset_id"],
+                        "face_index": best.get("face_index", 0),
+                        "thumbnail_url": best.get("face_thumbnail_url"),
+                        "is_from_video": best.get("is_from_video", False),
+                    }
+                    if not best.get("face_thumbnail_url"):
+                        needs_fallback.append((cid, best["asset_id"]))
+
+            # Batch-fetch asset thumbnails for faces missing face_thumbnail_url
+            if needs_fallback:
+                fallback_asset_ids = list(set(aid for _, aid in needs_fallback))
+                asset_result = self._store._client.table("album_assets") \
+                    .select("asset_id, asset_uri, thumbnail_uri, asset_type") \
+                    .in_("asset_id", fallback_asset_ids) \
+                    .execute()
+
+                asset_urls: dict = {}
+                if asset_result.data:
+                    for row in asset_result.data:
+                        aid = row["asset_id"]
+                        thumb = row.get("thumbnail_uri")
+                        uri = row.get("asset_uri")
+                        atype = row.get("asset_type", "photo")
+                        if thumb and thumb.startswith("http"):
+                            asset_urls[aid] = thumb
+                        elif atype == "photo" and uri and uri.startswith("http"):
+                            asset_urls[aid] = uri
+                        elif uri and uri.startswith("http"):
+                            lower = uri.lower()
+                            if any(lower.endswith(e) for e in ['.jpg', '.jpeg', '.png', '.webp', '.gif']):
+                                asset_urls[aid] = uri
+
+                for cid, aid in needs_fallback:
+                    if cid in result_map and not result_map[cid]["thumbnail_url"]:
+                        result_map[cid]["thumbnail_url"] = asset_urls.get(aid)
+
+            # Convert to SampleFace objects
+            final_map = {}
+            for cid, data in result_map.items():
+                final_map[cid] = [SampleFace(
+                    asset_id=data["asset_id"],
+                    face_index=data["face_index"],
+                    thumbnail_url=data["thumbnail_url"],
+                    is_from_video=data["is_from_video"],
+                )]
+
+            return final_map
+
+        except Exception as e:
+            logger.error(f"Failed to batch-fetch sample faces: {e}")
+            return {}
 
     async def _get_sample_faces(
         self,
@@ -555,23 +732,48 @@ class ClusteringService:
             if not result.data:
                 return []
 
+            # Collect asset_ids that need fallback thumbnails
+            missing_ids = set()
+            for row in result.data:
+                if not row.get("face_thumbnail_url"):
+                    missing_ids.add(row["asset_id"])
+
+            # Batch-fetch fallback thumbnails from album_assets
+            asset_urls: dict = {}
+            if missing_ids:
+                asset_result = self._store._client.table("album_assets") \
+                    .select("asset_id, asset_uri, thumbnail_uri, asset_type") \
+                    .in_("asset_id", list(missing_ids)) \
+                    .execute()
+                if asset_result.data:
+                    for arow in asset_result.data:
+                        aid = arow["asset_id"]
+                        thumb = arow.get("thumbnail_uri")
+                        uri = arow.get("asset_uri")
+                        atype = arow.get("asset_type", "photo")
+                        if thumb and thumb.startswith("http"):
+                            asset_urls[aid] = thumb
+                        elif atype == "photo" and uri and uri.startswith("http"):
+                            asset_urls[aid] = uri
+                        elif uri and uri.startswith("http"):
+                            lower = uri.lower()
+                            if any(lower.endswith(e) for e in ['.jpg', '.jpeg', '.png', '.webp', '.gif']):
+                                asset_urls[aid] = uri
+
             faces = []
             for row in result.data:
                 asset_id = row["asset_id"]
                 thumbnail_url = row.get("face_thumbnail_url")
-                bounding_box = row.get("bounding_box")
-
-                # If no face_thumbnail_url, try to get from album_assets (legacy fallback)
                 if not thumbnail_url:
-                    thumbnail_url = await self._get_asset_thumbnail(asset_id)
+                    thumbnail_url = asset_urls.get(asset_id)
 
                 faces.append({
-                    "id": row["id"],  # Face embedding ID for selection
+                    "id": row["id"],
                     "asset_id": asset_id,
                     "face_index": row.get("face_index", 0),
                     "thumbnail_url": thumbnail_url,
                     "is_from_video": row.get("is_from_video", False),
-                    "bounding_box": bounding_box
+                    "bounding_box": row.get("bounding_box")
                 })
 
             logger.info(f"Cluster {cluster_id}: returning {len(faces)} total faces")

@@ -108,27 +108,42 @@ async def run_clustering_task(
 ):
     """Background task for face clustering."""
     from api.routers.jobs import update_job
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    def on_progress(stage: str, detail: str, progress: int, **kwargs):
+        """Callback for clustering progress updates."""
+        logger.info(f"[clustering] {stage}: {detail}")
+        update_job(job_id, status="processing", progress=progress,
+                   error_message=f"{stage}: {detail}", **kwargs)
 
     try:
-        # Update job status to processing
-        update_job(job_id, status="processing", progress=10)
+        update_job(job_id, status="processing", progress=5,
+                   error_message="Starting clustering...")
 
         result = await clustering_service.cluster_faces(
             user_id=user_id,
             threshold=request.threshold,
-            min_cluster_size=request.min_cluster_size
+            min_cluster_size=request.min_cluster_size,
+            on_progress=on_progress
         )
 
-        # Update job status to completed
+        total_faces = result.num_faces_clustered + result.num_noise_faces
         update_job(
             job_id,
             status="completed",
             progress=100,
             processed=result.num_clusters if result else 0,
-            total=result.num_faces_clustered + result.num_noise_faces if result else 0
+            total=total_faces if result else 0,
+            error_message=None
+        )
+        logger.info(
+            f"[clustering] Done: {result.num_clusters} clusters from "
+            f"{total_faces} faces ({result.num_noise_faces} noise)"
         )
     except Exception as e:
-        # Update job status to failed
+        logger.error(f"[clustering] Failed: {e}")
         update_job(job_id, status="failed", error_message=str(e))
 
 
@@ -295,6 +310,17 @@ async def get_contact_images(
 
         for face in (direct_faces_result.data or []):
             face_asset_ids.add(face["asset_id"])
+
+        # Also check asset_tags for person tags linked to this contact
+        tags_result = supabase.table("asset_tags") \
+            .select("asset_id") \
+            .eq("created_by", user_id) \
+            .eq("contact_id", contact_id) \
+            .eq("tag_type", "person") \
+            .execute()
+
+        for tag in (tags_result.data or []):
+            face_asset_ids.add(tag["asset_id"])
 
         if not face_asset_ids:
             return {"contact_id": contact_id, "images": [], "total": 0}
@@ -612,7 +638,8 @@ async def preview_tag_sync(
                         tag_id=t["tag_id"],
                         contact_id=t["contact_id"],
                         contact_name=t.get("contact_name"),
-                        bounding_box=BoundingBox(**t["bounding_box"]) if t.get("bounding_box") else BoundingBox(x=0, y=0, width=0, height=0)
+                        bounding_box=BoundingBox(**t["bounding_box"]) if t.get("bounding_box") else BoundingBox(x=0, y=0, width=0, height=0),
+                        tagged_by=t.get("tagged_by")
                     ) for t in asset.get("manual_tags", [])
                 ]
                 ai_detections = [

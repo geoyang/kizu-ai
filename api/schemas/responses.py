@@ -115,6 +115,7 @@ class ManualTag(BaseModel):
     contact_id: str
     contact_name: Optional[str] = None
     bounding_box: BoundingBox
+    tagged_by: Optional[Dict[str, Any]] = None
 
 
 class AIDetection(BaseModel):
