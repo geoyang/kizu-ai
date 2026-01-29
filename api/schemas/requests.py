@@ -73,7 +73,7 @@ class ClusterFacesRequest(BaseModel):
 
 class AssignClusterRequest(BaseModel):
     """Request to assign a cluster to a contact."""
-    knox_contact_id: str
+    contact_id: str
     name: Optional[str] = None
     exclude_face_ids: Optional[List[str]] = None  # Face IDs to exclude from assignment
 

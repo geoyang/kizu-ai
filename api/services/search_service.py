@@ -369,7 +369,7 @@ class SearchService:
                 # Get face embedding linked to contact
                 result = supabase.table('face_clusters') \
                     .select('centroid_embedding') \
-                    .eq('knox_contact_id', contact_id) \
+                    .eq('contact_id', contact_id) \
                     .limit(1) \
                     .execute()
 

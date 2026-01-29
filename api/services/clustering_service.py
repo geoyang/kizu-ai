@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from api.stores import SupabaseVectorStore
 from api.schemas.responses import FaceClusterResponse, SampleFace
+from api.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -61,17 +62,22 @@ class ClusteringService:
                 num_noise_faces=len(embeddings)
             )
 
-        # 2. Run clustering
+        # 2. Auto-label faces from manual asset_tags (skips Apply step)
+        auto_labeled = await self._auto_label_from_tags(user_id)
+        if auto_labeled > 0:
+            logger.info(f"Auto-labeled {auto_labeled} faces from manual tags")
+
+        # 3. Run clustering
         labels = self._run_clustering(
             embeddings,
             threshold,
             min_cluster_size
         )
 
-        # 3. Save cluster assignments
+        # 4. Save cluster assignments
         await self._save_clusters(user_id, face_ids, labels)
 
-        # 4. Return stats
+        # 5. Return stats
         num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
         num_noise = sum(1 for l in labels if l == -1)
 
@@ -177,6 +183,140 @@ class ClusteringService:
 
         return labels
 
+    @staticmethod
+    def _is_normalized(box: dict) -> bool:
+        """Check if bounding box uses normalized 0-1 coordinates."""
+        return (box.get("x", 0) <= 1 and box.get("y", 0) <= 1 and
+                box.get("width", 0) <= 1 and box.get("height", 0) <= 1)
+
+    @staticmethod
+    def _normalize_box(box: dict, img_w: int, img_h: int) -> dict:
+        """Normalize bounding box to 0-1 range."""
+        if not box:
+            return {"x": 0, "y": 0, "width": 0, "height": 0}
+        if ClusteringService._is_normalized(box):
+            return {"x": box["x"], "y": box["y"],
+                    "width": box["width"], "height": box["height"]}
+        w = img_w or 1
+        h = img_h or 1
+        return {
+            "x": box.get("x", 0) / w,
+            "y": box.get("y", 0) / h,
+            "width": box.get("width", 0) / w,
+            "height": box.get("height", 0) / h,
+        }
+
+    @staticmethod
+    def _calculate_overlap(box1: dict, box2: dict) -> float:
+        """Calculate overlap ratio (intersection / smaller area)."""
+        x1_1, y1_1 = box1["x"], box1["y"]
+        x2_1, y2_1 = x1_1 + box1["width"], y1_1 + box1["height"]
+        x1_2, y1_2 = box2["x"], box2["y"]
+        x2_2, y2_2 = x1_2 + box2["width"], y1_2 + box2["height"]
+
+        ix1 = max(x1_1, x1_2)
+        iy1 = max(y1_1, y1_2)
+        ix2 = min(x2_1, x2_2)
+        iy2 = min(y2_1, y2_2)
+
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        a1 = box1["width"] * box1["height"]
+        a2 = box2["width"] * box2["height"]
+        smaller = min(a1, a2)
+        return 0.0 if smaller <= 0 else inter / smaller
+
+    async def _auto_label_from_tags(self, user_id: str) -> int:
+        """Auto-label face embeddings by cross-referencing manual asset_tags.
+
+        For each unlabeled face, finds overlapping person tags on the same
+        asset and inherits contact_id if overlap >= 40%.
+        """
+        await self._store.connect()
+
+        # Get unlabeled faces with bounding boxes
+        faces_result = self._store._client.table("face_embeddings") \
+            .select("id, asset_id, bounding_box") \
+            .eq("user_id", user_id) \
+            .is_("contact_id", "null") \
+            .not_.is_("bounding_box", "null") \
+            .execute()
+
+        if not faces_result.data:
+            return 0
+
+        asset_ids = list(set(f["asset_id"] for f in faces_result.data))
+
+        # Get person tags with contact_id for these assets
+        tags_result = self._store._client.table("asset_tags") \
+            .select("id, asset_id, contact_id, bounding_box") \
+            .eq("created_by", user_id) \
+            .eq("tag_type", "person") \
+            .not_.is_("contact_id", "null") \
+            .in_("asset_id", asset_ids) \
+            .execute()
+
+        if not tags_result.data:
+            logger.info(f"No person tags with contact_id found for auto-labeling")
+            return 0
+
+        # Group tags by asset
+        tags_by_asset: dict = {}
+        for tag in tags_result.data:
+            aid = tag["asset_id"]
+            if aid not in tags_by_asset:
+                tags_by_asset[aid] = []
+            tags_by_asset[aid].append(tag)
+
+        # Get image dimensions for coordinate normalization
+        dims_result = self._store._client.table("assets") \
+            .select("id, width, height") \
+            .in_("id", asset_ids) \
+            .execute()
+
+        asset_dims: dict = {}
+        for a in (dims_result.data or []):
+            asset_dims[a["id"]] = (a.get("width") or 1, a.get("height") or 1)
+
+        # Match faces to tags using bounding box overlap
+        labeled = 0
+        for face in faces_result.data:
+            asset_id = face["asset_id"]
+            face_box = face.get("bounding_box")
+            if not face_box or asset_id not in tags_by_asset:
+                continue
+
+            img_w, img_h = asset_dims.get(asset_id, (1, 1))
+            face_norm = self._normalize_box(face_box, img_w, img_h)
+
+            best_contact = None
+            best_overlap = 0.0
+
+            for tag in tags_by_asset[asset_id]:
+                tag_box = tag.get("bounding_box")
+                if not tag_box:
+                    continue
+                tag_norm = self._normalize_box(tag_box, img_w, img_h)
+                overlap = self._calculate_overlap(face_norm, tag_norm)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_contact = tag["contact_id"]
+
+            if best_contact and best_overlap >= 0.4:
+                self._store._client.table("face_embeddings") \
+                    .update({"contact_id": best_contact}) \
+                    .eq("id", face["id"]) \
+                    .execute()
+                labeled += 1
+
+        logger.info(
+            f"Auto-label: {labeled} faces labeled from "
+            f"{len(tags_result.data)} manual tags across "
+            f"{len(tags_by_asset)} assets"
+        )
+        return labeled
+
     async def _save_clusters(
         self,
         user_id: str,
@@ -210,26 +350,54 @@ class ClusteringService:
                 .eq("user_id", user_id) \
                 .execute()
 
-            # Create new clusters
+            # Create new clusters, auto-inheriting contact IDs from tagged faces
+            auto_assigned = 0
             for label, faces in cluster_faces.items():
                 cluster_id = str(uuid.uuid4())
 
+                # Check if any face in this cluster already has a contact_id
+                # (from tag sync or previous manual assignment)
+                contact_result = self._store._client.table("face_embeddings") \
+                    .select("contact_id") \
+                    .in_("id", faces) \
+                    .not_.is_("contact_id", "null") \
+                    .limit(1) \
+                    .execute()
+
+                inherited_contact_id = None
+                if contact_result.data and len(contact_result.data) > 0:
+                    inherited_contact_id = contact_result.data[0]["contact_id"]
+
                 # Create cluster record
-                self._store._client.table("face_clusters").insert({
+                cluster_record = {
                     "id": cluster_id,
                     "user_id": user_id,
                     "face_count": len(faces),
-                    "representative_face_id": faces[0] if faces else None
-                }).execute()
+                    "representative_face_id": faces[0] if faces else None,
+                }
+                if inherited_contact_id:
+                    cluster_record["contact_id"] = inherited_contact_id
+                    auto_assigned += 1
 
-                # Update face_embeddings with cluster_id
+                self._store._client.table("face_clusters").insert(
+                    cluster_record
+                ).execute()
+
+                # Update face_embeddings with cluster_id (and contact if inherited)
+                update_data = {"cluster_id": cluster_id}
+                if inherited_contact_id:
+                    update_data["contact_id"] = inherited_contact_id
+
                 for face_id in faces:
                     self._store._client.table("face_embeddings") \
-                        .update({"cluster_id": cluster_id}) \
+                        .update(update_data) \
                         .eq("id", face_id) \
                         .execute()
 
-            logger.info(f"Successfully saved {len(cluster_faces)} clusters")
+            logger.info(
+                f"Saved {len(cluster_faces)} clusters, "
+                f"{auto_assigned} auto-assigned from tag sync labels"
+            )
 
         except Exception as e:
             logger.error(f"Failed to save clusters: {e}")
@@ -260,7 +428,7 @@ class ClusteringService:
                 cluster = FaceClusterResponse(
                     cluster_id=row["id"],
                     name=row.get("name"),
-                    knox_contact_id=row.get("knox_contact_id"),
+                    contact_id=row.get("contact_id"),
                     face_count=row.get("face_count", 0),
                     sample_faces=sample_faces
                 )
@@ -426,7 +594,7 @@ class ClusteringService:
 
         try:
             # Update face_clusters with contact assignment
-            update_data = {"knox_contact_id": contact_id}
+            update_data = {"contact_id": contact_id}
             if name:
                 update_data["name"] = name
 
@@ -448,13 +616,13 @@ class ClusteringService:
                     if exclude_face_ids and face_id in exclude_face_ids:
                         # Remove excluded faces from cluster (set cluster_id to null)
                         self._store._client.table("face_embeddings") \
-                            .update({"cluster_id": None, "knox_contact_id": None}) \
+                            .update({"cluster_id": None, "contact_id": None}) \
                             .eq("id", face_id) \
                             .execute()
                     else:
                         # Assign to contact
                         self._store._client.table("face_embeddings") \
-                            .update({"knox_contact_id": contact_id}) \
+                            .update({"contact_id": contact_id}) \
                             .eq("id", face_id) \
                             .execute()
 
@@ -561,3 +729,159 @@ class ClusteringService:
         except Exception as e:
             logger.error(f"Failed to merge clusters: {e}")
             return None
+
+    async def recognize_faces(
+        self,
+        asset_id: str,
+        user_id: str,
+        similarity_threshold: float = 0.55,
+        worker_id: str = None
+    ) -> int:
+        """Recognize faces in a newly processed image by comparing against
+        labeled embeddings. Assigns contact_id and cluster_id to
+        any matching faces.
+
+        Called after face detection during image processing.
+
+        Returns number of faces recognized.
+        """
+        await self._store.connect()
+        client = self._store._client
+
+        try:
+            # Get new (unlabeled) face embeddings for this asset
+            new_faces = client.table("face_embeddings") \
+                .select("id, embedding, bounding_box, face_index") \
+                .eq("asset_id", asset_id) \
+                .eq("user_id", user_id) \
+                .is_("contact_id", "null") \
+                .execute()
+
+            if not new_faces.data:
+                return 0
+
+            # Get all labeled face embeddings for this user
+            labeled = client.table("face_embeddings") \
+                .select("id, embedding, contact_id, cluster_id") \
+                .eq("user_id", user_id) \
+                .not_.is_("contact_id", "null") \
+                .execute()
+
+            if not labeled.data:
+                logger.debug(f"[recognize] No labeled faces for user {user_id}")
+                return 0
+
+            # Parse labeled embeddings once
+            labeled_vecs = []
+            labeled_meta = []
+            for row in labeled.data:
+                vec = parse_pgvector(row.get("embedding", ""))
+                if vec:
+                    labeled_vecs.append(vec)
+                    labeled_meta.append({
+                        "contact_id": row["contact_id"],
+                        "cluster_id": row.get("cluster_id"),
+                    })
+
+            if not labeled_vecs:
+                return 0
+
+            # Build contact name cache for logging
+            contact_ids = list(set(
+                m["contact_id"] for m in labeled_meta
+            ))
+            contact_names: dict = {}
+            if contact_ids:
+                names_result = client.table("contacts") \
+                    .select("id, display_name") \
+                    .in_("id", contact_ids) \
+                    .execute()
+                for c in (names_result.data or []):
+                    contact_names[c["id"]] = c.get("display_name") or "Unknown"
+
+            labeled_matrix = np.array(labeled_vecs)
+            # Pre-normalize for cosine similarity
+            labeled_norms = np.linalg.norm(labeled_matrix, axis=1, keepdims=True)
+            labeled_normed = labeled_matrix / np.maximum(labeled_norms, 1e-10)
+
+            recognized = 0
+            for face_row in new_faces.data:
+                face_vec = parse_pgvector(face_row.get("embedding", ""))
+                if not face_vec:
+                    continue
+
+                face_arr = np.array(face_vec)
+                face_norm = np.linalg.norm(face_arr)
+                if face_norm < 1e-10:
+                    continue
+                face_normed = face_arr / face_norm
+
+                # Cosine similarity against all labeled faces
+                similarities = labeled_normed @ face_normed
+                best_idx = int(np.argmax(similarities))
+                best_sim = float(similarities[best_idx])
+
+                if best_sim >= similarity_threshold:
+                    match = labeled_meta[best_idx]
+                    update = {"contact_id": match["contact_id"]}
+                    if match.get("cluster_id"):
+                        update["cluster_id"] = match["cluster_id"]
+
+                    client.table("face_embeddings") \
+                        .update(update) \
+                        .eq("id", face_row["id"]) \
+                        .execute()
+
+                    # Update cluster face count if assigned to cluster
+                    if match.get("cluster_id"):
+                        count_result = client.table("face_embeddings") \
+                            .select("id", count="exact") \
+                            .eq("cluster_id", match["cluster_id"]) \
+                            .execute()
+                        client.table("face_clusters") \
+                            .update({"face_count": count_result.count or 0}) \
+                            .eq("id", match["cluster_id"]) \
+                            .execute()
+
+                    # Create a person tag in asset_tags so the UI shows it
+                    cid = match["contact_id"]
+                    cname = contact_names.get(cid, cid[:8])
+                    try:
+                        client.table("asset_tags").insert({
+                            "id": str(uuid.uuid4()),
+                            "asset_id": asset_id,
+                            "tag_type": "person",
+                            "tag_value": cname,
+                            "contact_id": cid,
+                            "bounding_box": face_row.get("bounding_box"),
+                            "face_index": face_row.get("face_index"),
+                            "created_by": user_id,
+                            "tagged_by": {
+                                "source": "kizu",
+                                "worker_id": worker_id or "unknown",
+                                "model": f"{get_settings().default_face_model}-{get_settings().face_model_name}",
+                                "similarity": round(best_sim, 3),
+                            },
+                        }).execute()
+                    except Exception as tag_err:
+                        logger.warning(
+                            f"[recognize] Failed to create tag: {tag_err}"
+                        )
+
+                    recognized += 1
+                    logger.info(
+                        f"[recognize] Face {face_row['id'][:8]} in "
+                        f"asset {asset_id[:8]} → \"{cname}\" "
+                        f"(sim={best_sim:.3f}, cluster={match.get('cluster_id', 'none')[:8] if match.get('cluster_id') else 'none'})"
+                    )
+
+            if recognized > 0:
+                logger.info(
+                    f"[recognize] Recognized {recognized}/{len(new_faces.data)} "
+                    f"faces in asset {asset_id[:8]}"
+                )
+            return recognized
+
+        except Exception as e:
+            logger.error(f"[recognize] Failed for asset {asset_id}: {e}")
+            return 0

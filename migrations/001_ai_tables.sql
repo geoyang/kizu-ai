@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS face_clusters (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
     name TEXT,  -- User-assigned name (nullable until labeled)
-    knox_contact_id UUID,  -- Link to Knox contact (if assigned)
+    contact_id UUID,  -- Link to Knox contact (if assigned)
     representative_face_id UUID,  -- Best face image for this cluster
     face_count INTEGER DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -49,7 +49,7 @@ CREATE INDEX IF NOT EXISTS idx_face_clusters_user
 ON face_clusters(user_id);
 
 CREATE INDEX IF NOT EXISTS idx_face_clusters_contact
-ON face_clusters(knox_contact_id);
+ON face_clusters(contact_id);
 
 -- ============================================
 -- Face Embeddings
@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS face_embeddings (
     bounding_box JSONB,  -- {x, y, width, height}
     landmarks JSONB,  -- Facial landmarks
     cluster_id UUID REFERENCES face_clusters(id) ON DELETE SET NULL,
-    knox_contact_id UUID,  -- Direct assignment to contact
+    contact_id UUID,  -- Direct assignment to contact
     confidence FLOAT,  -- Match confidence (1.0 for manual assignment)
     model_version TEXT NOT NULL DEFAULT 'insightface-buffalo-l',
     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -84,7 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_face_embeddings_cluster
 ON face_embeddings(cluster_id);
 
 CREATE INDEX IF NOT EXISTS idx_face_embeddings_contact
-ON face_embeddings(knox_contact_id);
+ON face_embeddings(contact_id);
 
 -- ============================================
 -- Detected Objects
@@ -266,7 +266,7 @@ RETURNS TABLE (
     face_index INT,
     similarity FLOAT,
     cluster_id UUID,
-    knox_contact_id UUID,
+    contact_id UUID,
     bounding_box JSONB
 )
 LANGUAGE plpgsql
@@ -279,7 +279,7 @@ BEGIN
         fe.face_index,
         1 - (fe.embedding <=> query_embedding) AS similarity,
         fe.cluster_id,
-        fe.knox_contact_id,
+        fe.contact_id,
         fe.bounding_box
     FROM face_embeddings fe
     WHERE (filter_user_id IS NULL OR fe.user_id = filter_user_id)

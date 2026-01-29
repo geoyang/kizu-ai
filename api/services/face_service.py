@@ -37,7 +37,7 @@ class FaceService:
         matches = []
         for result in results:
             matches.append(MatchedFace(
-                contact_id=result.metadata.get("knox_contact_id"),
+                contact_id=result.metadata.get("contact_id"),
                 cluster_id=result.metadata.get("cluster_id"),
                 confidence=result.score
             ))
@@ -103,7 +103,7 @@ class FaceService:
     ) -> bool:
         """Manually assign a face to a Knox contact."""
         # This would update face_embeddings table
-        # Setting knox_contact_id and confidence = 1.0
+        # Setting contact_id and confidence = 1.0
         # Placeholder for actual implementation
         logger.info(f"Assigning face {face_id} to contact {contact_id}")
         return True
@@ -114,7 +114,7 @@ class FaceService:
         limit: int = 100
     ) -> List[dict]:
         """Get faces that haven't been assigned to a contact."""
-        # Query face_embeddings where knox_contact_id is null
+        # Query face_embeddings where contact_id is null
         # Group by cluster_id
         # Placeholder
         return []

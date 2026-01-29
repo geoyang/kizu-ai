@@ -77,7 +77,7 @@ class FaceClusterResponse(BaseModel):
     """Response for a face cluster."""
     cluster_id: str
     name: Optional[str] = None
-    knox_contact_id: Optional[str] = None
+    contact_id: Optional[str] = None
     face_count: int
     sample_faces: List[SampleFace]
 

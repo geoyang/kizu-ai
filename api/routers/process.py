@@ -239,6 +239,305 @@ async def process_webhook(
         return {"status": "error", "error": str(e)}
 
 
+@router.get("/unprocessed-count")
+async def get_unprocessed_count(
+    user_id: str = Depends(get_current_user_id)
+):
+    """Get the count of assets that have not been AI-processed."""
+    from supabase import create_client
+    from api.config import settings
+
+    supabase = create_client(
+        settings.supabase_url, settings.supabase_service_role_key
+    )
+
+    result = supabase.table('assets') \
+        .select('id', count='exact') \
+        .eq('user_id', user_id) \
+        .is_('ai_processed_at', 'null') \
+        .execute()
+
+    return {
+        "total_unprocessed": result.count or 0,
+    }
+
+
+@router.get("/unprocessed")
+async def get_unprocessed_assets(
+    limit: int = 100,
+    offset: int = 0,
+    user_id: str = Depends(get_current_user_id)
+):
+    """Get a page of unprocessed asset IDs with their web_uri."""
+    from supabase import create_client
+    from api.config import settings
+
+    supabase = create_client(
+        settings.supabase_url, settings.supabase_service_role_key
+    )
+
+    result = supabase.table('assets') \
+        .select('id, web_uri') \
+        .eq('user_id', user_id) \
+        .is_('ai_processed_at', 'null') \
+        .order('created_at') \
+        .range(offset, offset + limit - 1) \
+        .execute()
+
+    return {
+        "assets": result.data or [],
+        "count": len(result.data or []),
+        "offset": offset,
+        "next_offset": offset + limit,
+    }
+
+
+@router.post("/queue-all")
+async def queue_all_unprocessed(
+    batch_size: int = 100,
+    offset: int = 0,
+    user_id: str = Depends(get_current_user_id)
+):
+    """
+    Queue unprocessed assets to ai_processing_jobs for the worker.
+
+    Inserts batch_size jobs at a time. Call repeatedly with increasing
+    offset to queue the entire collection. The worker processes them
+    and the Upload Queue tab shows per-asset progress.
+    """
+    from supabase import create_client
+    from api.config import settings
+    import logging
+
+    logger = logging.getLogger(__name__)
+    supabase = create_client(
+        settings.supabase_url, settings.supabase_service_role_key
+    )
+
+    # Get unprocessed assets for this batch (include web_uri for the worker)
+    assets_result = supabase.table('assets') \
+        .select('id, web_uri') \
+        .eq('user_id', user_id) \
+        .is_('ai_processed_at', 'null') \
+        .order('created_at') \
+        .range(offset, offset + batch_size - 1) \
+        .execute()
+
+    assets = assets_result.data or []
+
+    if not assets:
+        count_result = supabase.table('assets') \
+            .select('id', count='exact') \
+            .eq('user_id', user_id) \
+            .is_('ai_processed_at', 'null') \
+            .execute()
+
+        return {
+            "queued": 0,
+            "skipped": 0,
+            "total_remaining": count_result.count or 0,
+            "next_offset": offset,
+            "done": True,
+            "message": "No more unprocessed assets to queue",
+        }
+
+    asset_ids = [a['id'] for a in assets]
+    # Build a map of asset_id -> web_uri for inclusion in job params
+    uri_map = {a['id']: a.get('web_uri') for a in assets}
+
+    # Check which already have pending/processing jobs to avoid duplicates
+    existing_result = supabase.table('ai_processing_jobs') \
+        .select('input_params') \
+        .eq('user_id', user_id) \
+        .in_('status', ['pending', 'processing']) \
+        .execute()
+
+    existing_asset_ids = set()
+    for job in (existing_result.data or []):
+        params = job.get('input_params') or {}
+        aid = params.get('asset_id')
+        if aid:
+            existing_asset_ids.add(aid)
+
+    # Build jobs to insert
+    operations = ['embedding', 'faces', 'objects', 'describe']
+    jobs_to_insert = []
+    skipped = 0
+
+    for asset_id in asset_ids:
+        if asset_id in existing_asset_ids:
+            skipped += 1
+            continue
+        image_url = uri_map.get(asset_id)
+        if not image_url:
+            skipped += 1
+            logger.warning(f"[queue-all] Skipping {asset_id}: no web_uri")
+            continue
+        jobs_to_insert.append({
+            'user_id': user_id,
+            'job_type': 'process_image',
+            'status': 'pending',
+            'input_params': {
+                'asset_id': asset_id,
+                'image_url': image_url,
+                'operations': operations,
+            },
+            'progress': 0,
+            'total': 1,
+        })
+
+    queued = 0
+    if jobs_to_insert:
+        insert_result = supabase.table('ai_processing_jobs') \
+            .insert(jobs_to_insert) \
+            .execute()
+        queued = len(insert_result.data or [])
+
+    logger.info(
+        f"[queue-all] Queued {queued} jobs, skipped {skipped} "
+        f"(offset {offset}, batch {batch_size})"
+    )
+
+    # Get remaining count
+    count_result = supabase.table('assets') \
+        .select('id', count='exact') \
+        .eq('user_id', user_id) \
+        .is_('ai_processed_at', 'null') \
+        .execute()
+
+    total_remaining = count_result.count or 0
+
+    return {
+        "queued": queued,
+        "skipped": skipped,
+        "total_remaining": total_remaining,
+        "next_offset": offset + batch_size,
+        "done": len(assets) < batch_size,
+        "message": f"Queued {queued} assets, skipped {skipped} duplicates, "
+                   f"{total_remaining} remaining",
+    }
+
+
+@router.post("/batch-all")
+async def process_batch_all(
+    batch_size: int = 100,
+    offset: int = 0,
+    process_service: ProcessService = Depends(get_process_service),
+    user_id: str = Depends(get_current_user_id)
+):
+    """
+    Process a batch of unprocessed assets.
+
+    Call repeatedly with increasing offset to process all assets.
+    The frontend controls the loop and can stop between batches.
+    """
+    from supabase import create_client
+    from api.config import settings
+    import logging
+
+    logger = logging.getLogger(__name__)
+    supabase = create_client(
+        settings.supabase_url, settings.supabase_service_role_key
+    )
+
+    # Get unprocessed assets
+    assets_result = supabase.table('assets') \
+        .select('id, web_uri') \
+        .eq('user_id', user_id) \
+        .is_('ai_processed_at', 'null') \
+        .order('created_at') \
+        .range(offset, offset + batch_size - 1) \
+        .execute()
+
+    if not assets_result.data:
+        # Get remaining count to confirm we're done
+        count_result = supabase.table('assets') \
+            .select('id', count='exact') \
+            .eq('user_id', user_id) \
+            .is_('ai_processed_at', 'null') \
+            .execute()
+
+        return {
+            "processed": 0,
+            "failed": 0,
+            "total_remaining": count_result.count or 0,
+            "next_offset": offset,
+            "errors": [],
+            "message": "No more unprocessed assets in this range",
+        }
+
+    assets = assets_result.data
+    processed = 0
+    failed = 0
+    errors = []
+
+    for asset in assets:
+        try:
+            image_url = asset.get('web_uri')
+            if not image_url:
+                failed += 1
+                errors.append({
+                    "asset_id": asset['id'],
+                    "error": "No web_uri"
+                })
+                continue
+
+            image = load_image(image_url)
+
+            from api.schemas.requests import ProcessingOperation
+            await process_service.process_image(
+                asset_id=asset['id'],
+                image=image,
+                operations=[
+                    ProcessingOperation.EMBEDDING,
+                    ProcessingOperation.OBJECTS,
+                    ProcessingOperation.FACES,
+                    ProcessingOperation.DESCRIBE,
+                ],
+                user_id=user_id,
+                store_results=True,
+                worker_id="api-batch-all"
+            )
+            processed += 1
+            logger.info(
+                f"[batch-all] Processed {asset['id'][:8]}... "
+                f"({processed}/{len(assets)})"
+            )
+
+        except ValueError as e:
+            failed += 1
+            errors.append({
+                "asset_id": asset['id'],
+                "error": str(e)
+            })
+        except Exception as e:
+            failed += 1
+            errors.append({
+                "asset_id": asset['id'],
+                "error": str(e)
+            })
+            logger.error(f"[batch-all] Failed {asset['id']}: {e}")
+
+    # Get remaining unprocessed count
+    count_result = supabase.table('assets') \
+        .select('id', count='exact') \
+        .eq('user_id', user_id) \
+        .is_('ai_processed_at', 'null') \
+        .execute()
+
+    total_remaining = count_result.count or 0
+
+    return {
+        "processed": processed,
+        "failed": failed,
+        "total_remaining": total_remaining,
+        "next_offset": offset + batch_size,
+        "errors": errors[:10],
+        "message": f"Processed {processed}/{len(assets)} assets, "
+                   f"{total_remaining} remaining",
+    }
+
+
 @router.post("/reindex")
 async def reindex_all_assets(
     background_tasks: BackgroundTasks,

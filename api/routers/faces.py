@@ -144,12 +144,12 @@ async def list_clusters(
 
     # Filter based on params
     if not include_labeled:
-        clusters = [c for c in clusters if c.knox_contact_id is None]
+        clusters = [c for c in clusters if c.contact_id is None]
     if not include_unlabeled:
-        clusters = [c for c in clusters if c.knox_contact_id is not None]
+        clusters = [c for c in clusters if c.contact_id is not None]
 
     total_faces = sum(c.face_count for c in clusters)
-    unlabeled = sum(1 for c in clusters if c.knox_contact_id is None)
+    unlabeled = sum(1 for c in clusters if c.contact_id is None)
 
     return FaceClustersListResponse(
         clusters=clusters,
@@ -194,7 +194,7 @@ async def assign_cluster(
     """Assign a cluster to a Knox contact."""
     success = await clustering_service.assign_cluster_to_contact(
         cluster_id=cluster_id,
-        contact_id=request.knox_contact_id,
+        contact_id=request.contact_id,
         name=request.name,
         user_id=user_id,
         exclude_face_ids=request.exclude_face_ids
@@ -268,7 +268,7 @@ async def get_contact_images(
         clusters_result = supabase.table("face_clusters") \
             .select("id") \
             .eq("user_id", user_id) \
-            .eq("knox_contact_id", contact_id) \
+            .eq("contact_id", contact_id) \
             .execute()
 
         cluster_ids = [c["id"] for c in (clusters_result.data or [])]
@@ -286,11 +286,11 @@ async def get_contact_images(
             for face in (faces_result.data or []):
                 face_asset_ids.add(face["asset_id"])
 
-        # Also check for direct knox_contact_id assignment on face_embeddings
+        # Also check for direct contact_id assignment on face_embeddings
         direct_faces_result = supabase.table("face_embeddings") \
             .select("asset_id, face_thumbnail_url") \
             .eq("user_id", user_id) \
-            .eq("knox_contact_id", contact_id) \
+            .eq("contact_id", contact_id) \
             .execute()
 
         for face in (direct_faces_result.data or []):
@@ -336,7 +336,7 @@ async def clear_clustering(
 
     This will:
     - Delete all face clusters
-    - Clear cluster_id and knox_contact_id from all face embeddings
+    - Clear cluster_id from all face embeddings (preserves contact_id)
     - Optionally clear face thumbnails (if clear_thumbnails=True)
 
     After clearing, you can re-run clustering and backfill thumbnails.
@@ -354,7 +354,7 @@ async def clear_clustering(
             .execute()
 
         # Clear cluster assignments from face embeddings
-        update_data = {"cluster_id": None, "knox_contact_id": None}
+        update_data = {"cluster_id": None}
         if clear_thumbnails:
             update_data["face_thumbnail_url"] = None
 
@@ -687,7 +687,7 @@ async def apply_tag_sync(
 
     **What this does:**
     - For each confirmed match, links the AI face to the Knox contact
-    - Updates `face_embeddings.knox_contact_id` for future recognition
+    - Updates `face_embeddings.contact_id` for future recognition
 
     **Input:**
     - List of {manual_tag_id, ai_face_id} pairs from the preview step

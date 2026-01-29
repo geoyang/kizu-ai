@@ -68,6 +68,16 @@ class ProcessService:
                 asset_id, image, user_id, store_results
             )
 
+            # Recognize detected faces against known contacts
+            if store_results and results["faces"].get("count", 0) > 0:
+                try:
+                    recognized = await self._recognize_new_faces(
+                        asset_id, user_id, worker_id
+                    )
+                    results["faces"]["recognized"] = recognized
+                except Exception as e:
+                    logger.warning(f"Face recognition failed: {e}")
+
         if ProcessingOperation.OCR in ops:
             results["ocr"] = await self._extract_text(
                 asset_id, image, user_id
@@ -173,9 +183,9 @@ class ProcessService:
         except Exception as e:
             logger.warning(f"Could not delete existing objects (table may not exist): {e}")
 
-        # Delete existing AI-generated object tags
+        # Delete existing AI-generated object tags (those without a user creator)
         try:
-            supabase.table('asset_tags').delete().eq('asset_id', asset_id).eq('tag_type', 'object').execute()
+            supabase.table('asset_tags').delete().eq('asset_id', asset_id).eq('tag_type', 'object').is_('created_by', 'null').execute()
         except Exception as e:
             logger.warning(f"Could not delete existing object tags: {e}")
 
@@ -206,7 +216,6 @@ class ProcessService:
                 "asset_id": asset_id,
                 "tag_type": "object",
                 "tag_value": obj_class,
-                "created_by": "ai"
             }
             for obj_class in unique_objects
         ]
@@ -253,10 +262,6 @@ class ProcessService:
                         }
                     )
 
-            # Add face tags to asset_tags (unnamed faces, can be matched later)
-            if result.faces:
-                await self._store_face_tags(asset_id, result.faces)
-
         return {
             "success": True,
             "count": len(result.faces),
@@ -270,43 +275,6 @@ class ProcessService:
                 for f in result.faces
             ]
         }
-
-    async def _store_face_tags(self, asset_id: str, faces: list) -> None:
-        """Store detected faces as asset_tags for UI display."""
-        from supabase import create_client
-        from api.config import settings
-        import uuid
-
-        supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
-
-        # Delete existing AI-generated face tags (only those created by AI, not user-assigned)
-        try:
-            supabase.table('asset_tags').delete().eq(
-                'asset_id', asset_id
-            ).eq('tag_type', 'person').eq('created_by', 'ai').execute()
-        except Exception as e:
-            logger.warning(f"Could not delete existing face tags: {e}")
-
-        # Add a tag for each detected face
-        tag_records = [
-            {
-                "id": str(uuid.uuid4()),
-                "asset_id": asset_id,
-                "tag_type": "person",
-                "tag_value": f"Unknown Person",
-                "face_index": face.face_index,
-                "bounding_box": face.bounding_box.to_dict() if face.bounding_box else None,
-                "created_by": "ai"
-            }
-            for face in faces
-        ]
-
-        if tag_records:
-            try:
-                supabase.table('asset_tags').insert(tag_records).execute()
-                logger.info(f"Added {len(tag_records)} face tags for {asset_id}")
-            except Exception as e:
-                logger.warning(f"Could not add face tags: {e}")
 
     async def _extract_and_upload_face_thumbnail(
         self,
@@ -412,6 +380,17 @@ class ProcessService:
         except Exception as e:
             logger.warning(f"VLM description failed: {e}")
             return {"success": False, "error": str(e)}
+
+    async def _recognize_new_faces(
+        self, asset_id: str, user_id: str, worker_id: str = None
+    ) -> int:
+        """Recognize newly detected faces against labeled embeddings."""
+        from api.services.clustering_service import ClusteringService
+
+        clustering = ClusteringService(self._store)
+        return await clustering.recognize_faces(
+            asset_id, user_id, worker_id=worker_id
+        )
 
     async def _clear_asset_ai_data(self, asset_id: str) -> None:
         """Clear all existing AI data for an asset before reprocessing."""
