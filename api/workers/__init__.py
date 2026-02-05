@@ -1,10 +1,13 @@
 """Workers for background processing."""
 
-# Local worker (recommended - uses Supabase Realtime)
-from .local_worker import LocalWorker, run_worker
+# Unified worker handles all job types:
+# - ai_processing_jobs: embeddings, faces, objects, moments generation
+# - image_processing_jobs: thumbnails, web versions
+from .local_worker import UnifiedWorker, LocalWorker, run_worker
 
 __all__ = [
-    "LocalWorker",
+    "UnifiedWorker",
+    "LocalWorker",  # Backward compatibility alias
     "run_worker",
 ]
 
