@@ -1,6 +1,6 @@
 # Kizu AI - Personal Image Intelligence Engine
 
-A Docker-based, locally-hosted AI system that provides intelligent image search, automatic tagging, face recognition with clustering, and natural language queries. Integrates with Kizu/Supabase backend.
+A Docker-based, locally-hosted AI system that provides intelligent image search, automatic tagging, face recognition with clustering, photo moments generation, and image optimization. Integrates with Kizu/Supabase backend.
 
 ## Features
 
@@ -8,29 +8,37 @@ A Docker-based, locally-hosted AI system that provides intelligent image search,
 - **Face Recognition**: Automatic face detection, clustering, and identification
 - **Object Detection**: Find images containing specific objects
 - **OCR**: Search for text within images
-- **AI Descriptions**: Auto-generate image descriptions
+- **AI Descriptions**: Auto-generate image descriptions (Florence-2)
+- **Photo Moments**: Auto-generated photo collections (location, people, events, "on this day")
+- **Image Optimization**: Thumbnail and web version generation with EXIF orientation handling
+- **Video Transcoding**: Background video processing with FFmpeg
 - **100% Local**: All AI models run locally, no external APIs
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Docker Compose Stack                          │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐  │
-│  │   FastAPI    │    │    Redis     │    │  Celery Workers  │  │
-│  │   Gateway    │◄──►│   (Queue)    │◄──►│  (Processing)    │  │
-│  │   :8000      │    │   :6379      │    │                  │  │
-│  └──────────────┘    └──────────────┘    └──────────────────┘  │
-│                                                                  │
-│  AI Models: CLIP • YOLOv8 • InsightFace • EasyOCR • LLaVA      │
-└──────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-                    ┌──────────────────┐
-                    │  Supabase        │
-                    │  (pgvector)      │
-                    └──────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                          Docker Compose Stack                                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────┐   ┌─────────────────────────┐   ┌──────────────────────┐  │
+│  │   FastAPI     │   │    Unified AI Worker     │   │    Video Worker      │  │
+│  │   Gateway     │   │                          │   │                      │  │
+│  │   :8000       │   │  3 Job Types:            │   │  FFmpeg transcoding  │  │
+│  │               │   │  • Image AI processing   │   │                      │  │
+│  │  REST API for │   │  • Moments generation    │   └──────────────────────┘  │
+│  │  testing &    │   │  • Image optimization    │                             │
+│  │  management   │   │                          │                             │
+│  └──────────────┘   └─────────────────────────┘                              │
+│                                                                              │
+│  AI Models: CLIP • YOLOv8 • InsightFace • EasyOCR • Florence-2              │
+└────────────────────────────────────┬─────────────────────────────────────────┘
+                                     │ Pull-based (Realtime + polling)
+                                     ▼
+                           ┌──────────────────┐
+                           │    Supabase       │
+                           │  (pgvector, jobs) │
+                           └──────────────────┘
 ```
 
 ## Quick Start
@@ -44,94 +52,66 @@ A Docker-based, locally-hosted AI system that provides intelligent image search,
 ### Setup
 
 ```bash
-# Clone and setup
 cd ~/Development/Kizu-AI
-./scripts/setup.sh
 
 # Edit configuration
 cp .env.example .env
 nano .env  # Add Supabase credentials
 
 # Run database migrations
-# Copy contents of migrations/001_ai_tables.sql to Supabase SQL editor
+# Copy contents of migrations/*.sql to Supabase SQL editor
 
-# Start with Docker
+# Start with Docker (all services)
 docker-compose up -d
 
-# Or run locally
-uvicorn api.main:app --reload
+# Or run components locally
+uvicorn api.main:app --reload          # API server
+python run_worker.py                    # Unified AI worker
+python run_video_worker.py              # Video transcoding worker
 ```
 
-### Download Models
+### Running the Worker
 
 ```bash
-# Download all required models
-python scripts/download_models.py --all
+# Default
+python run_worker.py
 
-# Or download specific models
-python scripts/download_models.py --clip --yolo --face --ocr
-
-# Download LLaVA (optional, large)
-python scripts/download_models.py --llava
+# With custom options
+python run_worker.py --worker-id my-nas --poll-interval 10 --debug
 ```
 
-## API Endpoints
+The unified worker handles all 3 job types automatically. See [ARCHITECTURE.md](ARCHITECTURE.md) for details.
 
-### Search
+## API Documentation
 
-```bash
-# Natural language search
-curl -X POST http://localhost:8000/api/v1/search \
-  -H "Authorization: Bearer <token>" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "sunset photos from Hawaii", "limit": 20}'
-```
+Interactive Swagger docs available at `http://localhost:8000/docs` when the API server is running.
 
-### Process Images
+### Key Endpoints
 
-```bash
-# Process single image
-curl -X POST http://localhost:8000/api/v1/process/image \
-  -H "Authorization: Bearer <token>" \
-  -H "Content-Type: application/json" \
-  -d '{"asset_id": "uuid", "image_url": "https://...", "operations": ["all"]}'
+| Category | Endpoint | Description |
+|----------|----------|-------------|
+| Process | `POST /api/v1/process/image` | Process single image (sync) |
+| Process | `POST /api/v1/process/batch` | Batch process images (async) |
+| Search | `POST /api/v1/search` | Natural language semantic search |
+| Search | `POST /api/v1/search/by-face` | Find images of a person |
+| Faces | `POST /api/v1/faces/cluster` | Trigger face clustering |
+| Faces | `GET /api/v1/faces/clusters` | List face clusters |
+| Jobs | `GET /api/v1/jobs/{id}` | Check job status |
+| System | `GET /health` | Health check |
 
-# Batch processing
-curl -X POST http://localhost:8000/api/v1/process/batch \
-  -H "Authorization: Bearer <token>" \
-  -H "Content-Type: application/json" \
-  -d '{"asset_ids": ["uuid1", "uuid2"], "operations": ["embedding", "faces"]}'
-```
-
-### Face Clustering
-
-```bash
-# Trigger clustering
-curl -X POST http://localhost:8000/api/v1/faces/cluster \
-  -H "Authorization: Bearer <token>" \
-  -H "Content-Type: application/json" \
-  -d '{"threshold": 0.6}'
-
-# List clusters
-curl http://localhost:8000/api/v1/faces/clusters \
-  -H "Authorization: Bearer <token>"
-
-# Assign cluster to contact
-curl -X POST http://localhost:8000/api/v1/faces/clusters/<cluster_id>/assign \
-  -H "Authorization: Bearer <token>" \
-  -H "Content-Type: application/json" \
-  -d '{"knox_contact_id": "uuid", "name": "John Smith"}'
-```
+See [AI-PROCESSING.md](AI-PROCESSING.md) for full endpoint documentation.
 
 ## AI Models
 
-| Component | Model | Purpose |
-|-----------|-------|---------|
-| Embeddings | OpenCLIP ViT-B/32 | Semantic image search |
-| Objects | YOLOv8-m | Object detection (80 classes) |
-| Faces | InsightFace buffalo_l | Face detection & recognition |
-| OCR | EasyOCR | Text extraction |
-| VLM | LLaVA 1.5 7B | Image descriptions (optional) |
+All models are fully open source with no external API dependencies.
+
+| Component | Model | Dimension | Purpose |
+|-----------|-------|-----------|---------|
+| Embeddings | OpenCLIP ViT-B/32 | 512 | Semantic image search |
+| Objects | YOLOv8-m | N/A | Object detection (80 COCO classes) |
+| Faces | InsightFace buffalo_l | 512 | Face detection & recognition |
+| OCR | EasyOCR | N/A | Text extraction (15+ languages) |
+| VLM | Florence-2 | N/A | Image descriptions & captions |
 
 ### Model Abstraction
 
@@ -147,15 +127,11 @@ ModelRegistry.register(ModelType.EMBEDDER, "siglip", SigLIPEmbedder, is_default=
 
 ## Hardware Requirements
 
-### Minimum (MacBook M1)
-- 8GB RAM
-- Models: CLIP, YOLO, InsightFace, EasyOCR
-- No LLaVA
-
-### Recommended (Ryzen 7 + GPU)
-- 16GB+ RAM
-- NVIDIA GPU with 8GB+ VRAM (or AMD Radeon with ROCm)
-- All models including LLaVA
+| Configuration | RAM | GPU VRAM | Models Supported |
+|--------------|-----|----------|------------------|
+| Minimum (MacBook M1) | 8GB | N/A | CLIP, YOLO, InsightFace, EasyOCR |
+| Recommended | 16GB+ | 8GB+ | All models including Florence-2 |
+| Production | 32GB+ | 12GB+ | All models with batch processing |
 
 ## Project Structure
 
@@ -163,64 +139,43 @@ ModelRegistry.register(ModelType.EMBEDDER, "siglip", SigLIPEmbedder, is_default=
 Kizu-AI/
 ├── api/
 │   ├── core/
-│   │   ├── abstractions/    # Base classes for models
-│   │   └── registry.py      # Model registry
-│   ├── models/              # Concrete implementations
-│   │   ├── embedders/       # CLIP, SigLIP
+│   │   ├── abstractions/    # Base classes for all model types
+│   │   └── registry.py      # Model registry (lazy loading)
+│   ├── models/              # Concrete AI model implementations
+│   │   ├── embedders/       # CLIP
 │   │   ├── detectors/       # YOLO
 │   │   ├── faces/           # InsightFace
 │   │   ├── ocr/             # EasyOCR
-│   │   └── vlm/             # LLaVA
+│   │   └── vlm/             # Florence-2
 │   ├── services/            # Business logic
+│   │   ├── process_service.py     # Image processing orchestration
+│   │   ├── search_service.py      # Semantic search with NLP
+│   │   ├── clustering_service.py  # Face clustering (HDBSCAN)
+│   │   ├── face_service.py        # Face operations
+│   │   └── moments_service.py     # Photo moments generation
 │   ├── routers/             # API endpoints
-│   ├── stores/              # Vector storage
-│   └── workers/             # Celery tasks
-├── migrations/              # Database schema
-├── scripts/                 # Setup utilities
-└── docker-compose.yml
+│   ├── stores/              # Vector storage (pgvector)
+│   ├── workers/
+│   │   ├── local_worker.py  # Unified worker (3 job types)
+│   │   └── video_worker.py  # Video transcoding worker
+│   ├── schemas/             # Pydantic DTOs
+│   └── utils/               # Shared utilities
+├── migrations/              # Database schema (SQL)
+├── run_worker.py            # Unified worker entry point
+├── run_video_worker.py      # Video worker entry point
+├── docker-compose.yml       # Docker stack
+├── ARCHITECTURE.md          # System architecture
+└── AI-PROCESSING.md         # AI processing documentation
 ```
 
 ## Configuration
 
 See `.env.example` for all configuration options:
 
-- Supabase connection
-- Model selection
-- Processing settings
-- Redis configuration
-
-## Extending
-
-### Adding a New Embedder
-
-```python
-# api/models/embedders/siglip_embedder.py
-from api.core.abstractions import BaseEmbedder
-
-class SigLIPEmbedder(BaseEmbedder):
-    @property
-    def model_name(self) -> str:
-        return "siglip"
-
-    # Implement abstract methods...
-```
-
-### Adding a New Detector
-
-```python
-# api/models/detectors/detr_detector.py
-from api.core.abstractions import BaseDetector
-
-class DETRDetector(BaseDetector):
-    # Implement abstract methods...
-```
-
-## Integration with Kizu App
-
-1. **On Upload**: Call `/api/v1/process/webhook` from Supabase Edge Function
-2. **Batch Processing**: Trigger `/api/v1/process/batch` for existing assets
-3. **Search**: Use `/api/v1/search` for natural language queries
-4. **Face Clustering**: Run periodically or on-demand
+- Supabase connection (URL, anon key, service role key)
+- Model selection (CLIP variant, YOLO size, face model, VLM)
+- Processing settings (image size, batch size)
+- Privacy enforcement (`ALLOW_EXTERNAL_APIS=false`)
 
 ## License
 

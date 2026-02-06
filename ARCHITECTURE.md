@@ -10,102 +10,252 @@ The system uses a **pull-based architecture** where local AI workers pull jobs f
 +-------------------+          +----------------------------------------+
 |   Kizu Mobile /   |          |              SUPABASE (Cloud)          |
 |   Web App         |          |                                        |
-+--------+----------+          |  +------------+    +-----------------+ |
-         |                     |  |  Storage   |    | processing_queue| |
-         | Upload              |  |  (images)  |    |   (job queue)   | |
-         v                     |  +-----+------+    +--------+--------+ |
-+-------------------+          |        |  trigger          |           |
-|  Supabase Storage |--------->|        v                   | Realtime  |
-+-------------------+          |  +------------+            | WebSocket |
-                               |  | Insert job |            |           |
-                               |  +------------+            |           |
++--------+----------+          |  +------------+  +-------------------+ |
+         |                     |  |  Storage   |  | ai_processing_    | |
+         | Upload              |  |  (images)  |  | jobs              | |
+         v                     |  +-----+------+  +--------+----------+ |
++-------------------+          |        |  trigger         |            |
+|  Supabase Storage |--------->|        v                  | Realtime   |
++-------------------+          |  +------------+  +--------+----------+ |
+                               |  | Insert job |  | image_processing_ | |
+                               |  +------------+  | jobs              | |
+                               |                   +--------+----------+ |
                                +----------------------------------------+
-                                                            |
-                              ============ INTERNET =========
-                                                            |
-                               +----------------------------v-----------+
-                               |          LOCAL AI (Your NAS/PC)        |
-                               |                                        |
-                               |  +----------------------------------+  |
-                               |  |         Local Worker             |  |
-                               |  |                                  |  |
-                               |  |  1. Subscribe to Realtime        |  |
-                               |  |  2. Claim job atomically         |  |
-                               |  |  3. Download & process image     |  |
-                               |  |  4. Store results to Supabase    |  |
-                               |  +----------------------------------+  |
-                               |                                        |
-                               |  Models: CLIP | YOLO | InsightFace |   |
-                               |          Florence-2 | EasyOCR         |
-                               +----------------------------------------+
+                                                           |
+                             ============ INTERNET =========
+                                                           |
+                              +----------------------------v-----------+
+                              |          LOCAL AI (Your NAS/PC)        |
+                              |                                        |
+                              |  +----------------------------------+  |
+                              |  |       Unified AI Worker          |  |
+                              |  |                                  |  |
+                              |  |  Polls 2 tables, 3 job types:   |  |
+                              |  |  1. Image AI (embed/face/obj)   |  |
+                              |  |  2. Moments generation          |  |
+                              |  |  3. Image optimization          |  |
+                              |  +----------------------------------+  |
+                              |                                        |
+                              |  +----------------------------------+  |
+                              |  |       Video Worker               |  |
+                              |  |  FFmpeg transcoding              |  |
+                              |  +----------------------------------+  |
+                              |                                        |
+                              |  Models: CLIP | YOLO | InsightFace |   |
+                              |          Florence-2 | EasyOCR         |
+                              +----------------------------------------+
 ```
+
+## The Unified Worker
+
+The core of Kizu-AI is the **Unified Worker** (`api/workers/local_worker.py`) — a single process that manages **3 distinct job types** from **2 Supabase tables**. This design keeps deployment simple (one process to run) while handling all AI and image processing needs.
+
+### Job Types at a Glance
+
+| # | Job Type | Table | Handler | Purpose |
+|---|----------|-------|---------|---------|
+| 1 | Image AI | `ai_processing_jobs` | `_process_image_ai_job()` | CLIP embeddings, face detection, object detection, OCR, descriptions |
+| 2 | Moments Generation | `ai_processing_jobs` | `_process_moments_job()` | Auto-generate photo collections using 4 clustering methods |
+| 3 | Image Optimization | `image_processing_jobs` | `_process_image_job()` | Generate thumbnails and web-optimized versions |
+
+### How It Works
+
+```
+UnifiedWorker.start()
+    │
+    ├── Initialize Supabase client (service role)
+    ├── Initialize ProcessService (AI models)
+    ├── Subscribe to Realtime (instant notifications)
+    └── Enter main loop
+            │
+            ├── _poll_ai_jobs()        ← ai_processing_jobs table
+            │     │
+            │     ├── Fetch first pending job
+            │     ├── Claim atomically (eq status='pending')
+            │     └── Route by job_type:
+            │           ├── 'image_ai'        → _process_image_ai_job()
+            │           └── 'generate_moments' → _process_moments_job()
+            │
+            ├── _poll_image_jobs()     ← image_processing_jobs table
+            │     │
+            │     ├── Fetch first pending job
+            │     ├── Claim atomically
+            │     └── _process_image_job()
+            │
+            └── sleep(poll_interval)   ← default 5 seconds
+```
+
+### Atomic Job Claiming
+
+Multiple workers can run simultaneously without conflicts. Each worker claims jobs atomically:
+
+```python
+# Only succeeds if job is still 'pending' — prevents race conditions
+update_result = client.table('ai_processing_jobs').update({
+    'status': 'processing',
+    'worker_id': self._worker_id,
+    'picked_up_at': datetime.utcnow().isoformat(),
+}).eq('id', job['id']).eq('status', 'pending').execute()
+
+# If another worker claimed it first, update_result.data is empty
+if not update_result.data:
+    return  # Skip — already claimed
+```
+
+### Realtime + Polling Hybrid
+
+The worker uses two mechanisms for responsiveness:
+
+1. **Supabase Realtime**: Subscribes to INSERT events on both job tables for instant notifications
+2. **Polling fallback**: Polls every N seconds (default: 5) in case Realtime misses events
+
+---
+
+## Job Type 1: Image AI Processing
+
+**Table:** `ai_processing_jobs` with `job_type = 'image_ai'` (default)
+
+Runs AI models on a single image and stores results for search.
+
+### Operations
+
+| Operation | Model | Output Table | Description |
+|-----------|-------|-------------|-------------|
+| `embedding` | OpenCLIP ViT-B/32 | `image_embeddings` | 512-dim semantic vector for search |
+| `faces` | InsightFace buffalo_l | `face_embeddings` | Face detection + 512-dim recognition vectors |
+| `objects` | YOLOv8-m | `detected_objects` | Object detection (80 COCO classes) |
+| `ocr` | EasyOCR | `extracted_text` | Text extraction from images |
+| `describe` | Florence-2 | `image_descriptions` | AI-generated image captions |
+| `all` | All models | All tables | Run every operation |
+
+### Processing Flow
+
+1. Worker downloads image from Supabase Storage (or URL)
+2. `ProcessService.process_image()` runs requested operations
+3. Results stored to respective tables with `user_id` for isolation
+4. Face embeddings matched against existing clusters for recognition
+5. Job marked completed with result metadata
+
+### Input Parameters
+
+```json
+{
+  "asset_id": "uuid",
+  "image_url": "https://...",
+  "operations": ["embedding", "faces", "objects"]
+}
+```
+
+---
+
+## Job Type 2: Moments Generation
+
+**Table:** `ai_processing_jobs` with `job_type = 'generate_moments'`
+
+Automatically generates curated photo collections ("moments") for a user by analyzing their photo library. Uses 4 clustering methods with 2 fallbacks.
+
+### Clustering Methods
+
+#### 1. Location-Based (DBSCAN)
+- Groups photos by GPS coordinates using DBSCAN clustering
+- Parameters: ~5km radius (`eps_degrees = 0.045`), minimum 4 photos
+- Produces moments like "Adventures in San Francisco"
+
+#### 2. People-Based (Face Clusters)
+- Groups photos by recognized people using face clusters
+- Requires 4+ photos of the same person with a linked contact name
+- Produces moments like "Moments with John"
+
+#### 3. On This Day (Historical)
+- Finds photos from the same week in previous years
+- Uses a +/- 3 day window around today
+- Requires 3+ photos from the same year
+- Produces moments like "This week, 2 years ago"
+
+#### 4. Event-Based (Temporal)
+- Groups photos taken within 4-hour gaps into events
+- Maximum event duration: 3 days
+- Only considers the last 90 days, limits to 5 events
+- Produces moments like "Saturday afternoon at Central Park"
+
+#### Fallback 1: Most Common Location
+- If no moments from the 4 primary methods, finds the location with most photos
+
+#### Fallback 2: Recent Photos
+- Last resort — takes the 20 most recent photos
+
+### Cover Photo Selection
+
+Uses furthest-first traversal on CLIP embeddings to select 6 visually diverse cover photos.
+
+### User Settings
+
+Stored in `profiles.notification_settings`:
+
+```json
+{
+  "moments": true,
+  "moments_time": "09:00",
+  "moments_auto_delete_days": 7,
+  "moments_location": true,
+  "moments_people": true,
+  "moments_events": true,
+  "moments_on_this_day": true
+}
+```
+
+### Output
+
+Moments are stored in two tables:
+- `moments` — the moment metadata (title, subtitle, cover photos, expiry)
+- `moment_assets` — join table linking moments to photos (with display order)
+
+Unsaved moments auto-expire after the configured number of days (default: 7).
+
+---
+
+## Job Type 3: Image Optimization
+
+**Table:** `image_processing_jobs`
+
+Generates optimized image versions for fast display in the mobile and web apps.
+
+### Processing Steps
+
+1. Download source image from URL
+2. Apply EXIF orientation correction (supports all 8 orientations)
+3. Generate **thumbnail**: 300x300px, center-cropped, JPEG quality 80
+4. Generate **web version**: max 4096px longest side, JPEG quality 92
+5. Upload both to Supabase Storage: `{user_id}/processed/{asset_id}/`
+6. Update the `assets` table with `thumbnail` and `web_uri` URLs
+
+### HEIC Support
+
+Uses `pillow-heif` to handle Apple HEIC/HEIF images when available.
+
+---
+
+## Video Worker
+
+A separate worker (`api/workers/video_worker.py`) handles video transcoding using FFmpeg. It polls the same `image_processing_jobs` table for video jobs.
+
+**Entry point:** `python run_video_worker.py`
+
+---
 
 ## Core Components
 
-| Component | Purpose | Technology |
-|-----------|---------|------------|
-| API Gateway | REST endpoints for testing | FastAPI (uvicorn) |
-| Local Worker | Pull-based job processing | Supabase Realtime + async Python |
-| Processing Queue | Job queue with atomic claims | Supabase `processing_queue` table |
-| Vector Storage | Embedding similarity search | Supabase pgvector |
-| Model Registry | Dynamic model loading/swapping | Custom registry pattern |
-
-## Directory Structure
-
-```
-Kizu-AI/
-├── api/
-│   ├── core/
-│   │   ├── abstractions/          # Base classes for all model types
-│   │   │   ├── base_embedder.py   # Image/text embedding interface
-│   │   │   ├── base_detector.py   # Object detection interface
-│   │   │   ├── base_face_model.py # Face detection/recognition interface
-│   │   │   ├── base_ocr.py        # Text extraction interface
-│   │   │   └── base_vlm.py        # Vision-language model interface
-│   │   └── registry.py            # Model registry (lazy loading, singleton)
-│   ├── models/                    # Concrete model implementations
-│   │   ├── embedders/
-│   │   │   └── clip_embedder.py   # OpenCLIP ViT-B/32
-│   │   ├── detectors/
-│   │   │   └── yolo_detector.py   # YOLOv8 (COCO 80 classes)
-│   │   ├── faces/
-│   │   │   └── insightface_model.py # InsightFace buffalo_l
-│   │   ├── ocr/
-│   │   │   └── easyocr_model.py   # EasyOCR (15+ languages)
-│   │   └── vlm/
-│   │       └── llava_model.py     # LLaVA 1.5 7B (optional)
-│   ├── services/                  # Business logic layer
-│   │   ├── process_service.py     # Image processing orchestration
-│   │   ├── search_service.py      # Semantic search with NLP parsing
-│   │   ├── clustering_service.py  # Face clustering (DBSCAN)
-│   │   └── face_service.py        # Face operations
-│   ├── routers/                   # API endpoint definitions
-│   │   ├── process.py             # /process/* endpoints
-│   │   ├── search.py              # /search/* endpoints
-│   │   ├── faces.py               # /faces/* endpoints
-│   │   ├── jobs.py                # /jobs/* endpoints
-│   │   └── health.py              # /health, /models endpoints
-│   ├── stores/                    # Data persistence
-│   │   └── supabase_store.py      # pgvector operations
-│   ├── workers/                   # Background processing
-│   │   ├── local_worker.py        # Pull-based Supabase Realtime worker
-│   │   ├── celery_app.py          # Legacy Celery config (optional)
-│   │   └── tasks.py               # Legacy Celery tasks (optional)
-│   └── utils/                     # Shared utilities
-│       ├── device_utils.py        # CPU/GPU detection
-│       ├── image_utils.py         # Image loading/processing
-│       └── date_parser.py         # NLP date extraction
-├── migrations/                    # Database schema (SQL)
-│   ├── 001_ai_tables.sql          # Core AI tables (embeddings, faces, etc.)
-│   └── 002_processing_queue.sql   # Pull-based job queue
-├── scripts/
-│   └── download_models.py         # Model downloader
-├── model_cache/                   # Downloaded model weights
-├── run_worker.py                  # Local worker entry point
-├── docker-compose.yml             # Legacy stack (with Redis/Celery)
-├── docker-compose.local.yml       # Recommended: local worker stack
-└── docker-compose.prod.yml        # Production stack
-```
+| Component | File | Purpose |
+|-----------|------|---------|
+| Unified Worker | `api/workers/local_worker.py` | Polls and processes all 3 job types |
+| Video Worker | `api/workers/video_worker.py` | FFmpeg video transcoding |
+| Process Service | `api/services/process_service.py` | Orchestrates AI model operations |
+| Moments Service | `api/services/moments_service.py` | Photo moments clustering and generation |
+| Search Service | `api/services/search_service.py` | Semantic search with NLP date parsing |
+| Clustering Service | `api/services/clustering_service.py` | Face clustering (HDBSCAN) |
+| Face Service | `api/services/face_service.py` | Face operations |
+| Model Registry | `api/core/registry.py` | Lazy-loaded model management (singleton) |
+| Vector Store | `api/stores/supabase_store.py` | pgvector operations for embeddings |
 
 ## AI Models
 
@@ -117,60 +267,174 @@ All models are fully open source with no external API dependencies.
 | **YOLOv8-m** | `YOLODetector` | N/A | Object detection (80 COCO classes) |
 | **InsightFace buffalo_l** | `InsightFaceModel` | 512 | Face detection, recognition, clustering |
 | **EasyOCR** | `EasyOCRModel` | N/A | Text extraction (15+ languages) |
-| **LLaVA 1.5 7B** | `LLaVAModel` | N/A | Image descriptions (optional, resource-intensive) |
+| **Florence-2** | `Florence2Model` | N/A | Image descriptions & captions |
 
-## API Endpoints
+### Model Registry Pattern
 
-### Processing (`/api/v1/process`)
+Models are registered with lazy-loading factories and loaded on first use:
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/image` | Process single image (sync) |
-| POST | `/batch` | Process multiple images (async job) |
-| POST | `/webhook` | Real-time processing on upload |
-| POST | `/reindex` | Reindex assets without embeddings |
+```python
+from api.core import ModelRegistry
+from api.core.registry import ModelType
 
-**Operations**: `embedding`, `faces`, `objects`, `ocr`, `describe`, `all`
+# Get default model (lazy loaded on first call)
+embedder = ModelRegistry.get(ModelType.EMBEDDER)
 
-### Search (`/api/v1/search`)
+# Get specific variant
+detector = ModelRegistry.get(ModelType.DETECTOR, "yolo")
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/` | Natural language semantic search |
-| POST | `/by-face` | Find images containing a person |
-| POST | `/by-object` | Find images with specific objects |
-| GET | `/objects` | List detected object classes |
+# Unload to free memory
+ModelRegistry.unload(ModelType.EMBEDDER, "clip")
+ModelRegistry.unload_all()
+```
 
-### Faces (`/api/v1/faces`)
+## Database Schema
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/cluster` | Trigger face clustering |
-| GET | `/clusters` | List all face clusters |
-| GET | `/clusters/{id}` | Get cluster details |
-| POST | `/clusters/{id}/assign` | Link cluster to contact |
-| POST | `/clusters/merge` | Merge multiple clusters |
-| POST | `/clear-clustering` | Reset all clustering data |
-| POST | `/backfill-thumbnails` | Generate missing face thumbnails |
+### Job Tables
 
-### System (`/api/v1`)
+```
+ai_processing_jobs
+├── id              UUID PRIMARY KEY
+├── user_id         UUID
+├── asset_id        UUID
+├── job_type        TEXT ('image_api' | 'generate_moments')
+├── status          TEXT ('pending' | 'processing' | 'completed' | 'failed')
+├── input_params    JSONB {asset_id, image_url, operations[]}
+├── worker_id       TEXT (which worker claimed the job)
+├── progress        INT (0-100)
+├── result          JSONB
+├── error_message   TEXT
+├── created_at      TIMESTAMPTZ
+├── picked_up_at    TIMESTAMPTZ
+└── completed_at    TIMESTAMPTZ
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/health` | Health check with loaded models |
-| GET | `/models` | Current model configuration |
-| GET | `/models/available` | List registered models |
-| POST | `/models/load/{type}/{name}` | Manually load a model |
-| POST | `/models/unload/{type}/{name}` | Unload model to free memory |
-| POST | `/models/unload-all` | Unload all models |
+image_processing_jobs
+├── id              UUID PRIMARY KEY
+├── asset_id        UUID
+├── user_id         UUID
+├── status          TEXT
+├── input_url       TEXT (source image URL)
+├── input_orientation INT (EXIF 1-8)
+├── needs_web_version BOOLEAN
+├── metadata        JSONB
+├── progress        INT (0-100)
+├── current_step    TEXT
+├── thumbnail_url   TEXT (output)
+├── web_url         TEXT (output)
+├── error_message   TEXT
+├── created_at      TIMESTAMPTZ
+├── started_at      TIMESTAMPTZ
+└── completed_at    TIMESTAMPTZ
+```
 
-### Jobs (`/api/v1/jobs`)
+### AI Result Tables
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/` | List user's jobs |
-| GET | `/{id}` | Get job status |
-| DELETE | `/{id}` | Cancel pending job |
+```
+image_embeddings      ← CLIP 512-dim vectors (pgvector)
+face_embeddings       ← InsightFace 512-dim vectors + bounding boxes
+face_clusters         ← Grouped face identities
+detected_objects      ← YOLO detection results
+extracted_text        ← OCR text content
+image_descriptions    ← Florence-2 captions
+```
+
+### Moments Tables
+
+```
+moments
+├── id                UUID PRIMARY KEY
+├── user_id           UUID
+├── grouping_type     TEXT ('location' | 'people' | 'on_this_day' | 'event' | 'recent')
+├── grouping_criteria JSONB (clustering parameters)
+├── title             TEXT
+├── subtitle          TEXT
+├── cover_asset_ids   UUID[] (6 diverse cover photos)
+├── date_range_start  TIMESTAMPTZ
+├── date_range_end    TIMESTAMPTZ
+├── is_saved          BOOLEAN (user manually saved)
+├── expires_at        TIMESTAMPTZ (auto-delete)
+└── created_at        TIMESTAMPTZ
+
+moment_assets
+├── id              UUID PRIMARY KEY
+├── moment_id       UUID (references moments)
+├── asset_id        UUID (references assets)
+└── display_order   INT
+```
+
+## Processing Flows
+
+### Image Upload → AI Results
+
+1. User uploads image to Kizu Mobile/Web
+2. Image stored in Supabase Storage
+3. Edge function inserts job into `ai_processing_jobs` with `job_type='image_ai'`
+4. Worker receives Realtime notification (or polls)
+5. Worker claims job atomically, downloads image
+6. AI processes image (embedding, faces, objects, OCR, description)
+7. Results stored to pgvector tables
+8. Job marked completed — image is now searchable
+
+### Moments Generation
+
+1. Admin or scheduled trigger inserts job into `ai_processing_jobs` with `job_type='generate_moments'`
+2. Worker picks up job, loads user's moment settings
+3. `MomentsService.generate_moments_for_user()` runs 4 clustering methods
+4. Candidates scored and deduplicated
+5. Cover photos selected using CLIP embedding diversity
+6. Moments saved to `moments` + `moment_assets` tables with auto-expiry
+7. User sees moments in their feed
+
+### Image Optimization
+
+1. Asset created in Supabase, job inserted into `image_processing_jobs`
+2. Worker downloads source image
+3. EXIF orientation applied, thumbnail and web version generated
+4. Optimized images uploaded to Supabase Storage
+5. Asset record updated with `thumbnail` and `web_uri` URLs
+
+### Search Query
+
+1. User enters natural language query (e.g., "sunset photos from Hawaii")
+2. NLP parser extracts dates, locations, semantic terms
+3. CLIP embeds the semantic query into 512-dim vector
+4. pgvector cosine similarity search on `image_embeddings`
+5. Post-filter by date/location/object/face constraints
+6. Return ranked results with thumbnails
+
+## Deployment
+
+### Docker Compose Services
+
+```yaml
+services:
+  api:           # FastAPI server (port 8000)
+  worker:        # Unified AI worker (3 job types)
+  video-worker:  # FFmpeg video transcoding
+  worker-dev:    # Pre-configured for dev Supabase
+  video-worker-dev:  # Pre-configured for dev Supabase
+```
+
+### Running Locally
+
+```bash
+# All services
+docker-compose up -d
+
+# Or individually
+uvicorn api.main:app --reload          # API server
+python run_worker.py --debug           # Unified worker
+python run_video_worker.py --debug     # Video worker
+```
+
+### Multiple Workers
+
+Scale horizontally by running multiple worker instances. Atomic job claiming prevents duplicate processing:
+
+```bash
+python run_worker.py --worker-id nas-1 &
+python run_worker.py --worker-id nas-2 &
+```
 
 ## Configuration
 
@@ -184,232 +448,49 @@ SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 
 # Models
 MODEL_CACHE_DIR=./model_cache
-CLIP_MODEL=ViT-B-32              # ViT-B-32, ViT-L-14, etc.
-CLIP_PRETRAINED=openai           # openai, laion2b, etc.
-YOLO_SIZE=m                      # n, s, m, l, x
-FACE_MODEL_NAME=buffalo_l        # buffalo_l, buffalo_s
-FACE_THRESHOLD=0.6               # Face match threshold
+CLIP_MODEL=ViT-B-32
+CLIP_PRETRAINED=openai
+YOLO_SIZE=m                    # n, s, m, l, x
+FACE_MODEL_NAME=buffalo_l
+FACE_THRESHOLD=0.6
+DEFAULT_VLM=florence2
+FLORENCE_MODEL=microsoft/Florence-2-base
+VLM_QUANTIZATION=int8
 
 # Processing
-MAX_IMAGE_SIZE=2048              # Resize images larger than this
-BATCH_SIZE=8                     # Batch processing size
+MAX_IMAGE_SIZE=2048
+BATCH_SIZE=8
 
-# Infrastructure
-REDIS_URL=redis://localhost:6379/0
+# API
 API_HOST=0.0.0.0
 API_PORT=8000
 DEBUG=false
 
 # Privacy (always enforced)
-ALLOW_EXTERNAL_APIS=false        # External AI APIs disabled
+ALLOW_EXTERNAL_APIS=false
 ```
 
-## Adding New Models
+## Why Pull-Based?
 
-The registry pattern enables swapping models without code changes.
-
-### Step 1: Create Abstract Base (if new type)
-
-```python
-# api/core/abstractions/base_newtype.py
-from abc import ABC, abstractmethod
-
-class BaseNewType(ABC):
-    @property
-    @abstractmethod
-    def model_name(self) -> str:
-        pass
-
-    @abstractmethod
-    def load_model(self) -> None:
-        pass
-
-    @abstractmethod
-    def unload_model(self) -> None:
-        pass
-
-    # Add type-specific abstract methods
-```
-
-### Step 2: Implement Concrete Model
-
-```python
-# api/models/newtypes/my_model.py
-from api.core.abstractions import BaseNewType
-
-class MyModel(BaseNewType):
-    def __init__(self, model_variant: str = "default"):
-        self._model_name = f"mymodel-{model_variant}"
-        self._model = None
-
-    @property
-    def model_name(self) -> str:
-        return self._model_name
-
-    def load_model(self) -> None:
-        if self._model is not None:
-            return
-        # Load model weights
-        self._model = ...
-
-    def unload_model(self) -> None:
-        if self._model is not None:
-            del self._model
-            self._model = None
-```
-
-### Step 3: Register Model
-
-```python
-# api/models/newtypes/__init__.py
-from api.core import ModelRegistry
-from api.core.registry import ModelType
-from .my_model import MyModel
-
-ModelRegistry.register(
-    ModelType.NEW_TYPE,
-    "mymodel",
-    MyModel,
-    is_default=True
-)
-```
-
-### Step 4: Use Model
-
-```python
-from api.core import ModelRegistry
-from api.core.registry import ModelType
-
-# Get default model (lazy loaded)
-model = ModelRegistry.get(ModelType.NEW_TYPE)
-
-# Get specific variant
-model = ModelRegistry.get(ModelType.NEW_TYPE, "mymodel-large")
-
-# Unload when done
-ModelRegistry.unload(ModelType.NEW_TYPE, "mymodel")
-```
-
-## Local Worker
-
-The recommended way to run Kizu-AI is using the pull-based local worker.
-
-### Running the Worker
-
-```bash
-# Direct Python
-python run_worker.py
-
-# With options
-python run_worker.py --worker-id my-nas --poll-interval 10 --debug
-
-# Docker
-docker-compose -f docker-compose.local.yml up worker
-```
-
-### How It Works
-
-1. **Supabase Realtime subscription**: Worker subscribes to `processing_queue` INSERT events
-2. **Atomic job claiming**: Uses `claim_processing_job()` RPC with `FOR UPDATE SKIP LOCKED`
-3. **Polling fallback**: Also polls every N seconds in case Realtime misses events
-4. **Auto-retry**: Failed jobs retry up to `max_attempts` (default: 3)
-5. **Stale job recovery**: `reset_stale_processing_jobs()` resets stuck jobs
-
-### Processing Queue Schema
-
-```sql
-processing_queue
-├── id              UUID PRIMARY KEY
-├── asset_id        UUID (references assets)
-├── user_id         UUID (references auth.users)
-├── status          TEXT ('pending'|'processing'|'completed'|'failed')
-├── operations      TEXT[] (e.g., ['embedding','objects','faces'])
-├── worker_id       TEXT (claims ownership)
-├── priority        INT (1=highest, 10=lowest)
-├── attempts        INT
-├── result          JSONB
-├── error           TEXT
-└── timestamps      (created_at, started_at, completed_at)
-```
-
-### Why Pull-Based?
-
-| Push (Webhook) | Pull (Realtime) |
-|----------------|-----------------|
+| Push (Webhook) | Pull (Realtime + Polling) |
+|----------------|--------------------------|
 | Requires public endpoint | Works behind NAT/firewall |
 | Single point of failure | Multiple workers anywhere |
 | Complex networking | Simple: just outbound HTTPS |
-
-## Performance Considerations
-
-### Memory Management
-
-- **Single-threaded processing**: One job at a time to avoid OOM
-- **Lazy loading**: Models load on first use, not at startup
-- **Explicit unload**: `/models/unload-all` frees GPU/CPU memory
-- **Async I/O**: Network operations don't block model inference
-
-### Hardware Requirements
-
-| Configuration | RAM | GPU VRAM | Models Supported |
-|--------------|-----|----------|------------------|
-| Minimum (MacBook M1) | 8GB | N/A | CLIP, YOLO, InsightFace, EasyOCR |
-| Recommended | 16GB+ | 8GB+ | All models including LLaVA |
-| Production | 32GB+ | 12GB+ | All models with batch processing |
-
-### Device Detection
-
-The system auto-detects available hardware:
-
-```python
-# api/utils/device_utils.py
-def get_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"  # Apple Silicon
-    return "cpu"
-```
-
-InsightFace uses `CPUExecutionProvider` for cross-platform compatibility (M1/AMD/Intel).
+| Hard to scale | Add more workers instantly |
 
 ## Privacy Philosophy
 
-1. **All AI runs locally** - No data leaves the device
-2. **No cloud AI providers** - No OpenAI, Google, AWS AI services
-3. **Open source models only** - Fully auditable, no proprietary weights
-4. **No external API calls** - `ALLOW_EXTERNAL_APIS=false` enforced
-5. **User data isolation** - All queries filtered by `user_id`
+1. **All AI runs locally** — No data leaves the device
+2. **No cloud AI providers** — No OpenAI, Google, AWS AI services
+3. **Open source models only** — Fully auditable, no proprietary weights
+4. **No external API calls** — `ALLOW_EXTERNAL_APIS=false` enforced
+5. **User data isolation** — All queries filtered by `user_id`
 
-## Integration Points
+## Adding New Models
 
-### Supabase Tables
+See the [Model Abstraction](#model-registry-pattern) section. The registry pattern enables swapping models without changing worker or service code:
 
-| Table | Purpose |
-|-------|---------|
-| `image_embeddings` | CLIP vectors (pgvector) |
-| `face_embeddings` | Face vectors with bounding boxes |
-| `face_clusters` | Clustered face groups |
-| `detected_objects` | YOLO detection results |
-| `assets` | Source image metadata |
-| `album_assets` | Thumbnail references |
-
-### Processing Flow (Pull-Based)
-
-1. User uploads image to Kizu Mobile/Web
-2. Image stored in Supabase Storage
-3. Database trigger inserts job into `processing_queue`
-4. Local worker receives Realtime notification (or polls)
-5. Worker claims job atomically, downloads image
-6. AI processes image (embedding, faces, objects)
-7. Results stored in Supabase pgvector tables
-8. Job marked completed, search immediately available
-
-### Search Flow
-
-1. User enters natural language query
-2. NLP parser extracts dates, locations, semantic terms
-3. CLIP embeds semantic query
-4. pgvector similarity search
-5. Post-filter by date/location
-6. Return ranked results with thumbnails
+1. Create a class extending the appropriate base (`BaseEmbedder`, `BaseDetector`, etc.)
+2. Register it in the model registry
+3. Set it as default or load it on demand via the API
