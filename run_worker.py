@@ -30,11 +30,19 @@ def setup_logging(debug: bool = False) -> None:
     level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
         handlers=[
             logging.StreamHandler(sys.stdout)
         ]
     )
+    # Suppress noisy loggers — only show warnings and errors
+    for name in ('httpx', 'httpcore', 'hpack', 'supabase', 'postgrest',
+                 'realtime', 'gotrue', 'storage3', 'PIL', 'urllib3',
+                 'watchdog', 'onnxruntime', 'torch', 'transformers',
+                 'asyncio', 'api.core', 'api.core.registry', 'api.stores',
+                 'api.services.process_service', 'api.models'):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def register_models() -> None:
@@ -110,16 +118,9 @@ async def main(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    logger.info("=" * 60)
-    logger.info("Kizu AI Local Worker")
-    logger.info("=" * 60)
-    logger.info(f"Supabase URL: {settings.supabase_url}")
-    logger.info(f"Poll interval: {args.poll_interval}s")
-    logger.info(f"Worker ID: {args.worker_id or 'auto-generated'}")
-    logger.info("=" * 60)
+    logger.info(f"Kizu AI Worker | ID: {args.worker_id or 'auto'} | Poll: {args.poll_interval}s")
 
     # Register AI models
-    logger.info("Registering AI models...")
     register_models()
 
     # Create and start worker

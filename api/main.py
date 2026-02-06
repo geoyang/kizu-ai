@@ -14,6 +14,7 @@ from api.routers import (
     faces_router,
     jobs_router,
     health_router,
+    video_router,
 )
 
 # Configure logging
@@ -137,6 +138,7 @@ app.include_router(search_router, prefix="/api/v1")
 app.include_router(process_router, prefix="/api/v1")
 app.include_router(faces_router, prefix="/api/v1")
 app.include_router(jobs_router, prefix="/api/v1")
+app.include_router(video_router, prefix="/api/v1")
 
 
 @app.get("/")

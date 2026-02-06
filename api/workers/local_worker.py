@@ -95,10 +95,7 @@ class UnifiedWorker:
 
     async def start(self) -> None:
         """Start the worker."""
-        logger.info(f"Starting unified worker: {self._worker_id}")
-
-        if not HEIF_SUPPORTED:
-            logger.warning("HEIC/HEIF support not available - install pillow-heif")
+        logger.info(f"[{self._worker_id}] Starting")
 
         # Initialize Supabase client
         self._client = create_client(
@@ -115,6 +112,7 @@ class UnifiedWorker:
         self._process_service = ProcessService(vector_store)
 
         self._running = True
+        self._has_image_jobs_table = True  # Will be set to False if table doesn't exist
 
         # Set up signal handlers for graceful shutdown
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -125,24 +123,20 @@ class UnifiedWorker:
 
     async def _run_loop(self) -> None:
         """Main worker loop - polls all job tables."""
-        logger.info(f"Worker {self._worker_id} entering main loop")
+        logger.info(f"[{self._worker_id}] Polling for jobs...")
 
         # Start realtime subscription in background
         realtime_task = asyncio.create_task(self._subscribe_realtime())
 
         try:
             while self._running:
-                # Poll AI processing jobs
                 await self._poll_ai_jobs()
-
-                # Poll image processing jobs
-                await self._poll_image_jobs()
-
-                # Wait before next poll
+                if self._has_image_jobs_table:
+                    await self._poll_image_jobs()
                 await asyncio.sleep(self._poll_interval)
 
         except asyncio.CancelledError:
-            logger.info("Worker loop cancelled")
+            pass
         finally:
             realtime_task.cancel()
             try:
@@ -150,7 +144,7 @@ class UnifiedWorker:
             except asyncio.CancelledError:
                 pass
 
-        logger.info(f"Worker {self._worker_id} stopped")
+        logger.info(f"[{self._worker_id}] Stopped")
 
     async def _subscribe_realtime(self) -> None:
         """Subscribe to Supabase Realtime for instant job notifications."""
@@ -158,12 +152,11 @@ class UnifiedWorker:
             channel = self._client.channel('job_changes')
 
             def on_ai_insert(payload):
-                logger.info(f"Realtime: New AI job detected")
                 asyncio.create_task(self._poll_ai_jobs())
 
             def on_image_insert(payload):
-                logger.info(f"Realtime: New image job detected")
-                asyncio.create_task(self._poll_image_jobs())
+                if self._has_image_jobs_table:
+                    asyncio.create_task(self._poll_image_jobs())
 
             channel.on_postgres_changes(
                 event='INSERT',
@@ -180,14 +173,12 @@ class UnifiedWorker:
             )
 
             await channel.subscribe()
-            logger.info("Subscribed to Supabase Realtime for job tables")
 
             while self._running:
                 await asyncio.sleep(1)
 
-        except Exception as e:
-            logger.warning(f"Realtime subscription error: {e}")
-            logger.info("Falling back to polling only")
+        except Exception:
+            pass  # Expected in sync mode, fall back to polling
 
     # =========================================================================
     # AI Processing Jobs (embeddings, faces, objects, moments)
@@ -211,6 +202,8 @@ class UnifiedWorker:
                 return
 
             job = result.data[0]
+            job_type = job.get('job_type', 'image_ai')
+            short_id = job['id'][:8]
 
             # Claim the job
             update_result = self._client.table('ai_processing_jobs').update({
@@ -221,19 +214,17 @@ class UnifiedWorker:
             }).eq('id', job['id']).eq('status', 'pending').execute()
 
             if not update_result.data or len(update_result.data) == 0:
-                logger.debug(f"AI job {job['id']} already claimed")
                 return
 
             self._current_job_id = job['id']
             self._current_job_table = 'ai_processing_jobs'
 
-            job_type = job.get('job_type', 'image_ai')
-            logger.info(f"Claimed AI job {job['id']} (type: {job_type})")
+            logger.info(f"[{self._worker_id}] Picked up {job_type} job {short_id}")
 
             await self._process_ai_job(job)
 
         except Exception as e:
-            logger.error(f"Error polling AI jobs: {e}")
+            logger.error(f"[{self._worker_id}] AI poll error: {e}")
         finally:
             self._current_job_id = None
             self._current_job_table = None
@@ -310,10 +301,10 @@ class UnifiedWorker:
                 'completed_at': datetime.utcnow().isoformat(),
             }).eq('id', job_id).execute()
 
-            logger.info(f"Completed AI job {job_id} for asset {asset_id}")
+            logger.info(f"[{self._worker_id}] Done AI job {job_id[:8]} (asset {asset_id[:8] if asset_id else '?'})")
 
         except Exception as e:
-            logger.error(f"AI job {job_id} failed: {e}")
+            logger.error(f"[{self._worker_id}] AI job {job_id[:8]} failed: {e}")
             error_msg = str(e)[:200]
             if '<!DOCTYPE' in error_msg or '<html' in error_msg.lower():
                 error_msg = "Failed to load image: URL returned HTML instead of image"
@@ -331,8 +322,10 @@ class UnifiedWorker:
         job_id = job['id']
         user_id = job.get('user_id')
 
+        short_id = job_id[:8]
+
         if not user_id:
-            logger.error(f"[{job_id}] No user_id in moments job")
+            logger.error(f"[{self._worker_id}] Moments job {short_id}: no user_id")
             self._fail_ai_job(job_id, "No user_id provided")
             return
 
@@ -340,7 +333,6 @@ class UnifiedWorker:
             settings_data = await self._get_user_moment_settings(user_id)
 
             if not settings_data.get('moments', True):
-                logger.info(f"[{job_id}] Moments disabled for user {user_id}")
                 self._complete_ai_job(job_id, {'skipped': True, 'reason': 'moments_disabled'})
                 return
 
@@ -357,8 +349,6 @@ class UnifiedWorker:
                 on_progress=on_progress
             )
 
-            logger.info(f"[{job_id}] Generated {len(moments)} moments")
-
             saved_count = 0
             auto_delete_days = settings_data.get('moments_auto_delete_days', 7)
 
@@ -367,7 +357,7 @@ class UnifiedWorker:
                     await self._save_moment(user_id, moment, auto_delete_days)
                     saved_count += 1
                 except Exception as e:
-                    logger.error(f"[{job_id}] Failed to save moment: {e}")
+                    logger.error(f"[{self._worker_id}] Moments {short_id}: save failed: {e}")
 
             self._complete_ai_job(job_id, {
                 'moments_generated': len(moments),
@@ -377,11 +367,11 @@ class UnifiedWorker:
             if saved_count > 0:
                 await self._queue_moments_notification(user_id, saved_count)
 
-            logger.info(f"[{job_id}] Moments job completed: {saved_count} saved")
+            logger.info(f"[{self._worker_id}] Done moments job {short_id}: {saved_count}/{len(moments)} saved")
 
         except Exception as e:
             error_msg = str(e)[:500]
-            logger.error(f"[{job_id}] Moments job failed: {error_msg}")
+            logger.error(f"[{self._worker_id}] Moments job {short_id} failed: {error_msg}")
             self._fail_ai_job(job_id, error_msg)
 
     # =========================================================================
@@ -406,6 +396,7 @@ class UnifiedWorker:
                 return
 
             job = result.data[0]
+            short_id = job['id'][:8]
 
             # Claim the job
             update_result = self._client.table('image_processing_jobs').update({
@@ -415,23 +406,26 @@ class UnifiedWorker:
             }).eq('id', job['id']).eq('status', 'pending').execute()
 
             if not update_result.data or len(update_result.data) == 0:
-                logger.debug(f"Image job {job['id']} already claimed")
                 return
 
             self._current_job_id = job['id']
             self._current_job_table = 'image_processing_jobs'
 
-            # Update asset status
             self._client.table('assets').update({
                 'image_processing_status': 'processing'
             }).eq('id', job['asset_id']).execute()
 
-            logger.info(f"Claimed image job {job['id']} for asset {job['asset_id']}")
+            logger.info(f"[{self._worker_id}] Picked up image job {short_id}")
 
             await self._process_image_job(job)
 
         except Exception as e:
-            logger.error(f"Error polling image jobs: {e}")
+            err_msg = str(e)
+            # Table doesn't exist — disable polling silently
+            if 'PGRST205' in err_msg or 'image_processing_jobs' in err_msg:
+                self._has_image_jobs_table = False
+                return
+            logger.error(f"[{self._worker_id}] Image poll error: {e}")
         finally:
             self._current_job_id = None
             self._current_job_table = None
@@ -448,40 +442,28 @@ class UnifiedWorker:
 
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                # Download input image
-                logger.info(f"[{job_id}] Downloading image")
                 self._update_image_job_progress(job_id, 10, 'downloading')
-
                 input_path = os.path.join(temp_dir, "input")
                 await self._download_file(input_url, input_path)
 
-                # Open image
-                logger.info(f"[{job_id}] Processing image")
                 self._update_image_job_progress(job_id, 20, 'processing')
                 img = Image.open(input_path)
-
-                # Handle EXIF orientation
                 img = self._apply_orientation(img, orientation)
 
-                # Generate thumbnail
                 thumbnail_url = None
                 if metadata.get('generate_thumbnail', True):
-                    logger.info(f"[{job_id}] Generating thumbnail")
                     self._update_image_job_progress(job_id, 40, 'generating_thumbnail')
                     thumbnail_url = await self._generate_and_upload_thumbnail(
                         img, user_id, asset_id, temp_dir
                     )
 
-                # Generate web version
                 web_url = None
                 if needs_web_version and metadata.get('generate_web_version', True):
-                    logger.info(f"[{job_id}] Generating web version")
                     self._update_image_job_progress(job_id, 70, 'generating_web_version')
                     web_url = await self._generate_and_upload_web_version(
                         img, user_id, asset_id, temp_dir
                     )
 
-                # Complete job
                 self._update_image_job_progress(job_id, 90, 'uploading')
 
                 self._client.table('image_processing_jobs').update({
@@ -502,11 +484,11 @@ class UnifiedWorker:
 
                 self._client.table('assets').update(update_data).eq('id', asset_id).execute()
 
-                logger.info(f"[{job_id}] Image job completed")
+                logger.info(f"[{self._worker_id}] Done image job {job_id[:8]}")
 
         except Exception as e:
             error_msg = str(e)[:500]
-            logger.error(f"[{job_id}] Image job failed: {error_msg}")
+            logger.error(f"[{self._worker_id}] Image job {job_id[:8]} failed: {error_msg}")
 
             self._client.table('image_processing_jobs').update({
                 'status': 'failed',
@@ -642,10 +624,10 @@ class UnifiedWorker:
         try:
             result = self._client.table('profiles').select(
                 'notification_settings'
-            ).eq('id', user_id).single().execute()
+            ).eq('id', user_id).limit(1).execute()
 
-            if result.data:
-                ns = result.data.get('notification_settings') or {}
+            if result.data and len(result.data) > 0:
+                ns = result.data[0].get('notification_settings') or {}
                 return {
                     'moments': ns.get('moments', DEFAULT_MOMENT_SETTINGS['moments']),
                     'moments_time': ns.get('moments_time', DEFAULT_MOMENT_SETTINGS['moments_time']),
@@ -702,14 +684,9 @@ class UnifiedWorker:
     async def _queue_moments_notification(self, user_id: str, moment_count: int) -> None:
         """Queue push notification for new moments."""
         try:
-            action_log_id = str(uuid.uuid4())
-            self._client.table('actions_log').insert({
-                'id': action_log_id,
-                'user_id': user_id,
-                'action_type': 'moment_generated',
-                'entity_type': 'moment',
-                'metadata': {'count': moment_count},
-            }).execute()
+            # Skip notification queuing for now - actions_log schema needs moment support
+            logger.info(f"[{self._worker_id}] {moment_count} moment(s) generated for user {user_id[:8]}")
+            return
 
             title = "New Moments Available" if moment_count > 1 else "New Moment Available"
             body = f"You have {moment_count} new photo moment{'s' if moment_count > 1 else ''} to explore!"
@@ -725,16 +702,13 @@ class UnifiedWorker:
                 'deep_link_id': 'feed',
             }).execute()
 
-            logger.info(f"Queued notification for {moment_count} moments")
-
         except Exception as e:
-            logger.warning(f"Failed to queue notification: {e}")
+            logger.error(f"[{self._worker_id}] Notification queue failed: {e}")
 
     def _update_ai_job_progress(self, job_id: str, progress: int, step: str) -> None:
         """Update AI job progress."""
         self._client.table('ai_processing_jobs').update({
             'progress': progress,
-            'current_step': step,
         }).eq('id', job_id).execute()
 
     def _complete_ai_job(self, job_id: str, result: dict) -> None:
@@ -742,7 +716,6 @@ class UnifiedWorker:
         self._client.table('ai_processing_jobs').update({
             'status': 'completed',
             'progress': 100,
-            'current_step': 'completed',
             'result': result,
             'completed_at': datetime.utcnow().isoformat(),
         }).eq('id', job_id).execute()
@@ -811,12 +784,11 @@ class UnifiedWorker:
 
     def _handle_shutdown(self, signum, frame) -> None:
         """Handle shutdown signal."""
-        logger.info(f"Received signal {signum}, shutting down...")
+        logger.info(f"[{self._worker_id}] Shutting down...")
         self._running = False
 
     async def stop(self) -> None:
         """Stop the worker gracefully."""
-        logger.info(f"Stopping worker {self._worker_id}")
         self._running = False
 
 

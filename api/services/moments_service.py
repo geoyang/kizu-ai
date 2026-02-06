@@ -87,6 +87,14 @@ class MomentsService:
             report("Done", "Not enough assets for moments", 100)
             return []
 
+        # Log asset metadata stats for debugging
+        has_gps = sum(1 for a in assets if a.get('latitude') and a.get('longitude'))
+        has_location_name = sum(1 for a in assets if a.get('location_name'))
+        has_date = sum(1 for a in assets if a.get('created_at'))
+        logger.info(f"[moments] Asset stats: total={len(assets)}, "
+                     f"with_gps={has_gps}, with_location_name={has_location_name}, "
+                     f"with_date={has_date}")
+
         # Generate location-based moments
         if settings.get('moments_location', True):
             report("Location", "Clustering by location...", 20)
@@ -115,6 +123,21 @@ class MomentsService:
             moments.extend(event_moments)
             report("Events", f"Found {len(event_moments)} event moments", 95)
 
+        # Fallback: if nothing matched, try location fallback then recent photos
+        if not moments:
+            report("Fallback", "No moments found, trying location fallback...", 90)
+            fallback = await self._fallback_location_moment(user_id, assets)
+            if fallback:
+                moments.append(fallback)
+                report("Fallback", "Created 1 fallback location moment", 95)
+
+        if not moments:
+            report("Fallback", "Location fallback failed, creating recent photos moment...", 92)
+            fallback = await self._fallback_recent_photos(user_id, assets)
+            if fallback:
+                moments.append(fallback)
+                report("Fallback", "Created 1 recent photos moment", 95)
+
         report("Done", f"Generated {len(moments)} total moments", 100)
         return moments
 
@@ -126,7 +149,7 @@ class MomentsService:
 
         while True:
             result = self._client.table("assets") \
-                .select("id, path, thumbnail, web_uri, created_at, location_lat, location_lng, location_name, media_type, width, height") \
+                .select("id, path, thumbnail, web_uri, created_at, latitude, longitude, location_name, media_type, width, height") \
                 .eq("user_id", user_id) \
                 .order("created_at", desc=True) \
                 .range(offset, offset + page_size - 1) \
@@ -158,7 +181,7 @@ class MomentsService:
         # Filter assets with valid GPS coordinates
         geo_assets = [
             a for a in assets
-            if a.get('location_lat') and a.get('location_lng')
+            if a.get('latitude') and a.get('longitude')
         ]
 
         if len(geo_assets) < 4:
@@ -170,7 +193,7 @@ class MomentsService:
 
             # Prepare coordinates (lat, lng)
             coords = np.array([
-                [a['location_lat'], a['location_lng']]
+                [a['latitude'], a['longitude']]
                 for a in geo_assets
             ])
 
@@ -208,8 +231,8 @@ class MomentsService:
                 date_end = max(dates) if dates else None
 
                 # Calculate cluster center
-                center_lat = np.mean([a['location_lat'] for a in cluster_assets])
-                center_lng = np.mean([a['location_lng'] for a in cluster_assets])
+                center_lat = np.mean([a['latitude'] for a in cluster_assets])
+                center_lng = np.mean([a['longitude'] for a in cluster_assets])
 
                 # Select cover photos
                 cover_ids = await self._select_cover_photos(
@@ -289,10 +312,10 @@ class MomentsService:
                 contact_result = self._client.table("contacts") \
                     .select("display_name") \
                     .eq("id", contact_id) \
-                    .single() \
+                    .limit(1) \
                     .execute()
-                if contact_result.data:
-                    person_name = contact_result.data.get('display_name')
+                if contact_result.data and len(contact_result.data) > 0:
+                    person_name = contact_result.data[0].get('display_name')
 
             if not person_name:
                 person_name = "Someone"
@@ -342,16 +365,24 @@ class MomentsService:
         assets: List[Dict]
     ) -> List[GeneratedMoment]:
         """
-        Find photos from the same day in previous years.
+        Find photos from roughly the same week in previous years.
 
-        Creates moments with 3+ photos from the same month/day.
+        Uses a ±3 day window around today and creates moments
+        with 3+ photos per year.
         """
         moments = []
         today = datetime.now()
-        current_month = today.month
-        current_day = today.day
 
-        # Group assets by year for today's date
+        # Build a set of (month, day) tuples for ±3 day window
+        window_dates = set()
+        for delta in range(-3, 4):
+            d = today + timedelta(days=delta)
+            window_dates.add((d.month, d.day))
+
+        window_start = today + timedelta(days=-3)
+        window_end = today + timedelta(days=3)
+
+        # Group assets by year for dates within the window
         by_year: Dict[int, List[Dict]] = {}
 
         for asset in assets:
@@ -360,7 +391,7 @@ class MomentsService:
 
             try:
                 dt = datetime.fromisoformat(asset['created_at'].replace('Z', '+00:00'))
-                if dt.month == current_month and dt.day == current_day:
+                if (dt.month, dt.day) in window_dates:
                     year = dt.year
                     if year != today.year:
                         if year not in by_year:
@@ -391,23 +422,36 @@ class MomentsService:
                 [a['id'] for a in year_assets]
             )
 
-            title = f"{years_ago} year{'s' if years_ago > 1 else ''} ago today"
+            title = f"This week, {years_ago} year{'s' if years_ago > 1 else ''} ago"
             subtitle = f"{len(year_assets)} photos{location_text}"
+
+            # Use actual min/max created_at from matched assets
+            asset_dates = []
+            for a in year_assets:
+                try:
+                    asset_dates.append(
+                        datetime.fromisoformat(a['created_at'].replace('Z', '+00:00'))
+                    )
+                except (ValueError, TypeError):
+                    continue
+            date_start = min(asset_dates) if asset_dates else datetime(year, 1, 1)
+            date_end = max(asset_dates) if asset_dates else datetime(year, 12, 31)
 
             moments.append(GeneratedMoment(
                 grouping_type='on_this_day',
                 grouping_criteria={
                     'year': year,
-                    'month': current_month,
-                    'day': current_day,
+                    'window_start': f"{window_start.month:02d}-{window_start.day:02d}",
+                    'window_end': f"{window_end.month:02d}-{window_end.day:02d}",
+                    'window_days': 3,
                     'years_ago': years_ago,
                 },
                 title=title,
                 subtitle=subtitle,
                 cover_asset_ids=cover_ids,
                 all_asset_ids=[a['id'] for a in year_assets],
-                date_range_start=datetime(year, current_month, current_day),
-                date_range_end=datetime(year, current_month, current_day, 23, 59, 59),
+                date_range_start=date_start,
+                date_range_end=date_end,
             ))
 
         return moments
@@ -538,7 +582,7 @@ class MomentsService:
 
         try:
             # Try to get CLIP embeddings for diversity selection
-            embeddings_result = self._client.table("asset_embeddings") \
+            embeddings_result = self._client.table("image_embeddings") \
                 .select("asset_id, embedding") \
                 .in_("asset_id", asset_ids) \
                 .limit(200) \
@@ -637,6 +681,100 @@ class MomentsService:
         simple_name = location_name.split(',')[0].strip()
 
         return f"{prefix} {simple_name}"
+
+    async def _fallback_location_moment(
+        self,
+        user_id: str,
+        assets: List[Dict]
+    ) -> Optional[GeneratedMoment]:
+        """
+        Fallback: pick the location_name with the most photos
+        and create a single moment from it. Requires at least 3 photos.
+        """
+        from collections import Counter
+
+        named = [a for a in assets if a.get('location_name')]
+        if len(named) < 3:
+            return None
+
+        counts = Counter(a['location_name'] for a in named)
+        best_location, count = counts.most_common(1)[0]
+        if count < 3:
+            return None
+
+        group = [a for a in named if a['location_name'] == best_location]
+
+        dates = []
+        for a in group:
+            try:
+                dates.append(datetime.fromisoformat(a['created_at'].replace('Z', '+00:00')))
+            except (ValueError, TypeError):
+                continue
+
+        cover_ids = await self._select_cover_photos(user_id, [a['id'] for a in group])
+        title = self._generate_location_title(best_location)
+        subtitle = f"{len(group)} photos from {best_location.split(',')[0].strip()}"
+
+        return GeneratedMoment(
+            grouping_type='location',
+            grouping_criteria={
+                'location_name': best_location,
+                'fallback': True,
+            },
+            title=title,
+            subtitle=subtitle,
+            cover_asset_ids=cover_ids,
+            all_asset_ids=[a['id'] for a in group],
+            date_range_start=min(dates) if dates else None,
+            date_range_end=max(dates) if dates else None,
+        )
+
+    async def _fallback_recent_photos(
+        self,
+        user_id: str,
+        assets: List[Dict]
+    ) -> Optional[GeneratedMoment]:
+        """
+        Last-resort fallback: create a moment from the most recent photos.
+        Works with any assets regardless of metadata.
+        """
+        if len(assets) < 3:
+            return None
+
+        # Sort by created_at descending, take up to 20
+        dated = sorted(
+            [a for a in assets if a.get('created_at')],
+            key=lambda a: a['created_at'],
+            reverse=True
+        )
+
+        if len(dated) < 3:
+            return None
+
+        group = dated[:20]
+
+        dates = []
+        for a in group:
+            try:
+                dates.append(datetime.fromisoformat(a['created_at'].replace('Z', '+00:00')))
+            except (ValueError, TypeError):
+                continue
+
+        cover_ids = await self._select_cover_photos(user_id, [a['id'] for a in group])
+
+        title = "Recent Photos"
+        subtitle = f"{len(group)} photos"
+
+        return GeneratedMoment(
+            grouping_type='recent',
+            grouping_criteria={'fallback': True, 'count': len(group)},
+            title=title,
+            subtitle=subtitle,
+            cover_asset_ids=cover_ids,
+            all_asset_ids=[a['id'] for a in group],
+            date_range_start=min(dates) if dates else None,
+            date_range_end=max(dates) if dates else None,
+        )
 
     def _generate_event_title(self, date: datetime, location: str = "") -> str:
         """Generate a title for an event-based moment."""

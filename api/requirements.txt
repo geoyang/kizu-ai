@@ -38,6 +38,7 @@ scikit-learn>=1.3.0
 # Image utilities
 imagehash>=4.3.0
 opencv-python-headless>=4.8.0
+pillow-heif>=0.13.0  # HEIC/HEIF image support
 
 # Task queue (OPTIONAL - only for legacy Celery-based processing)
 # The local worker uses Supabase Realtime instead

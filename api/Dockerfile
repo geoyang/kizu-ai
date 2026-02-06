@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install system dependencies
+# Install system dependencies (including FFmpeg for video transcoding)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libgl1 \
@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     git \
     curl \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Create app directory
@@ -32,6 +33,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY api/ ./api/
 COPY run_worker.py ./run_worker.py
+COPY run_video_worker.py ./run_video_worker.py
 
 # Create model cache directory
 RUN mkdir -p /app/model_cache

@@ -41,6 +41,50 @@ services:
       - ./run_worker.py:/app/run_worker.py  # Mount worker script
     restart: unless-stopped
 
+  video-worker:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    command: watchmedo auto-restart --directory=/app/api --pattern=*.py --recursive -- python run_video_worker.py --debug
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+    volumes:
+      - ./api:/app/api  # Mount for hot-reload
+      - ./run_video_worker.py:/app/run_video_worker.py  # Mount video worker script
+    restart: unless-stopped
+
+  worker-dev:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    command: watchmedo auto-restart --directory=/app/api --pattern=*.py --recursive -- python run_worker.py --worker-id worker-dev --debug
+    environment:
+      - SUPABASE_URL=https://cbuclvdrdqetfwecphhw.supabase.co
+      - SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNidWNsdmRyZHFldGZ3ZWNwaGh3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk5NzA0ODYsImV4cCI6MjA4NTU0NjQ4Nn0.9ZDmuL3juAiOUyLGkRxk0rKrZzYx3TLNRC62NFlJ3J4
+      - SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNidWNsdmRyZHFldGZ3ZWNwaGh3Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2OTk3MDQ4NiwiZXhwIjoyMDg1NTQ2NDg2fQ.rFrPI_E1xKBy3VirCyQOneO9TGJ8Fh7a5shNklaXob8
+      - MODEL_CACHE_DIR=/app/model_cache
+    volumes:
+      - model_cache:/app/model_cache
+      - ./api:/app/api
+      - ./run_worker.py:/app/run_worker.py
+    restart: unless-stopped
+
+  video-worker-dev:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    command: watchmedo auto-restart --directory=/app/api --pattern=*.py --recursive -- python run_video_worker.py --debug
+    environment:
+      - SUPABASE_URL=https://cbuclvdrdqetfwecphhw.supabase.co
+      - SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNidWNsdmRyZHFldGZ3ZWNwaGh3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk5NzA0ODYsImV4cCI6MjA4NTU0NjQ4Nn0.9ZDmuL3juAiOUyLGkRxk0rKrZzYx3TLNRC62NFlJ3J4
+      - SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNidWNsdmRyZHFldGZ3ZWNwaGh3Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2OTk3MDQ4NiwiZXhwIjoyMDg1NTQ2NDg2fQ.rFrPI_E1xKBy3VirCyQOneO9TGJ8Fh7a5shNklaXob8
+    volumes:
+      - ./api:/app/api  # Mount for hot-reload
+      - ./run_video_worker.py:/app/run_video_worker.py  # Mount video worker script
+    restart: unless-stopped
+
 volumes:
   model_cache:
     driver: local
