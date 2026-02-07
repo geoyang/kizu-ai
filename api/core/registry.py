@@ -11,6 +11,7 @@ from .abstractions import (
     BaseOCR,
     BaseVLM,
     BaseVectorStore,
+    BaseRestorer,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ class ModelType(Enum):
     OCR = "ocr"
     VLM = "vlm"
     VECTOR_STORE = "vector_store"
+    RESTORER = "restorer"
 
 
 class ModelRegistry:
@@ -39,6 +41,7 @@ class ModelRegistry:
         ModelType.OCR: {},
         ModelType.VLM: {},
         ModelType.VECTOR_STORE: {},
+        ModelType.RESTORER: {},
     }
 
     _instances: Dict[str, Any] = {}

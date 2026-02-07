@@ -5,6 +5,7 @@ from .detectors import YOLODetector
 from .faces import InsightFaceModel
 from .ocr import EasyOCRModel
 from .vlm import LLaVAModel, BLIP2Model, Florence2Model
+from .restorers import RealESRGANRestorer, GFPGANRestorer
 
 __all__ = [
     "CLIPEmbedder",
@@ -14,4 +15,6 @@ __all__ = [
     "LLaVAModel",
     "BLIP2Model",
     "Florence2Model",
+    "RealESRGANRestorer",
+    "GFPGANRestorer",
 ]

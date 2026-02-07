@@ -13,6 +13,7 @@ class ProcessingOperation(str, Enum):
     OBJECTS = "objects"
     OCR = "ocr"
     DESCRIBE = "describe"
+    RESTORE = "restore"
     ALL = "all"
 
 

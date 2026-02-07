@@ -30,7 +30,8 @@ class ProcessService:
         user_id: str,
         store_results: bool = True,
         force_reprocess: bool = False,
-        worker_id: str = None
+        worker_id: str = None,
+        restore_type: str = "both",
     ) -> dict:
         """
         Process a single image with specified operations.
@@ -86,6 +87,11 @@ class ProcessService:
         if ProcessingOperation.DESCRIBE in ops:
             results["description"] = await self._generate_description(
                 asset_id, image, user_id
+            )
+
+        if ProcessingOperation.RESTORE in ops:
+            results["restore"] = await self._restore_image(
+                asset_id, image, user_id, store_results, restore_type
             )
 
         # Mark asset as AI processed
@@ -381,6 +387,153 @@ class ProcessService:
             logger.warning(f"VLM description failed: {e}")
             return {"success": False, "error": str(e)}
 
+    async def _restore_image(
+        self,
+        asset_id: str,
+        image: Image.Image,
+        user_id: str,
+        store: bool = True,
+        restore_type: str = "both",
+    ) -> dict:
+        """Restore/enhance image using Real-ESRGAN and/or GFP-GAN."""
+        import time
+
+        # Determine which model to use
+        if restore_type == "faces" or restore_type == "both":
+            model_name = "gfpgan"
+        else:
+            model_name = "realesrgan"
+
+        try:
+            # Free memory by unloading other models before restore
+            for mt in [ModelType.EMBEDDER, ModelType.DETECTOR,
+                       ModelType.FACE, ModelType.OCR, ModelType.VLM]:
+                for name in list(ModelRegistry._instances.keys()):
+                    if name.startswith(mt.value + ":"):
+                        ModelRegistry.unload(mt, name.split(":", 1)[1])
+
+            # Limit input image size to prevent OOM on CPU
+            max_dim = settings.restore_max_input_size
+            if max(image.size) > max_dim:
+                ratio = max_dim / max(image.size)
+                new_size = (
+                    int(image.width * ratio),
+                    int(image.height * ratio),
+                )
+                logger.info(
+                    f"Downscaling restore input {image.size} -> {new_size} "
+                    f"(max {max_dim}px)"
+                )
+                image = image.resize(new_size, Image.Resampling.LANCZOS)
+
+            restorer = ModelRegistry.get(ModelType.RESTORER, model_name)
+            result = restorer.restore(image)
+
+            if store:
+                # Convert restored image to JPEG bytes
+                buffer = io.BytesIO()
+                restored_rgb = result.restored_image
+                if restored_rgb.mode in ('RGBA', 'P'):
+                    restored_rgb = restored_rgb.convert('RGB')
+                restored_rgb.save(buffer, format='JPEG', quality=92)
+                buffer.seek(0)
+                image_bytes = buffer.getvalue()
+
+                # Upload to Supabase Storage
+                from supabase import create_client
+
+                supabase = create_client(
+                    settings.supabase_url,
+                    settings.supabase_service_role_key,
+                )
+
+                timestamp = int(time.time())
+                storage_path = (
+                    f"{user_id}/restored/{asset_id}_{timestamp}.jpg"
+                )
+
+                import httpx
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    upload_url = (
+                        f"{settings.supabase_url}/storage/v1/object"
+                        f"/assets/{storage_path}"
+                    )
+                    response = await client.post(
+                        upload_url,
+                        content=image_bytes,
+                        headers={
+                            "Authorization": f"Bearer {settings.supabase_service_role_key}",
+                            "Content-Type": "image/jpeg",
+                            "x-upsert": "true",
+                        },
+                    )
+                    if response.status_code not in [200, 201]:
+                        raise RuntimeError(
+                            f"Upload failed: {response.status_code}"
+                        )
+
+                web_uri = (
+                    f"{settings.supabase_url}/storage/v1/object/public"
+                    f"/assets/{storage_path}"
+                )
+
+                # Insert record into restored_assets table
+                restored_record = {
+                    "original_asset_id": asset_id,
+                    "user_id": user_id,
+                    "storage_path": storage_path,
+                    "web_uri": web_uri,
+                    "restore_type": restore_type,
+                    "model_used": result.model_version,
+                    "upscale_factor": settings.restore_upscale,
+                    "processing_time_ms": result.processing_time_ms,
+                    "file_size_bytes": len(image_bytes),
+                }
+
+                insert_result = supabase.table(
+                    'restored_assets'
+                ).insert(restored_record).execute()
+
+                restored_asset_id = (
+                    insert_result.data[0].get('id')
+                    if insert_result.data else None
+                )
+
+                logger.info(
+                    f"Restored asset {asset_id} -> {restored_asset_id} "
+                    f"({restore_type}, {result.processing_time_ms}ms)"
+                )
+
+                # Unload model after processing to free memory
+                ModelRegistry.unload(ModelType.RESTORER, model_name)
+
+                return {
+                    "success": True,
+                    "restored_asset_id": restored_asset_id,
+                    "storage_path": storage_path,
+                    "web_uri": web_uri,
+                    "processing_time_ms": result.processing_time_ms,
+                }
+
+            # Non-store mode (testing)
+            ModelRegistry.unload(ModelType.RESTORER, model_name)
+
+            return {
+                "success": True,
+                "width": result.restored_image.width,
+                "height": result.restored_image.height,
+                "processing_time_ms": result.processing_time_ms,
+            }
+
+        except Exception as e:
+            logger.error(f"Restoration failed for {asset_id}: {e}")
+            # Ensure model is unloaded even on failure
+            try:
+                ModelRegistry.unload(ModelType.RESTORER, model_name)
+            except Exception:
+                pass
+            return {"success": False, "error": str(e)}
+
     async def _recognize_new_faces(
         self, asset_id: str, user_id: str, worker_id: str = None
     ) -> int:
@@ -459,6 +612,8 @@ class ProcessService:
                 model_versions['ocr'] = 'easyocr'
             if 'describe' in operations:
                 model_versions['vlm'] = settings.default_vlm
+            if 'restore' in operations:
+                model_versions['restorer'] = settings.restore_model
 
             now = datetime.now(timezone.utc)
 

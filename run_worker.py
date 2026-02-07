@@ -53,6 +53,8 @@ def register_models() -> None:
         InsightFaceModel,
         EasyOCRModel,
         Florence2Model,
+        RealESRGANRestorer,
+        GFPGANRestorer,
     )
     from api.core.registry import ModelType
 
@@ -103,6 +105,25 @@ def register_models() -> None:
             quantization=settings.vlm_quantization
         ),
         is_default=True
+    )
+
+    ModelRegistry.register(
+        ModelType.RESTORER,
+        "realesrgan",
+        lambda: RealESRGANRestorer(
+            outscale=settings.restore_upscale,
+            cache_dir=settings.model_cache_dir,
+        ),
+        is_default=True
+    )
+
+    ModelRegistry.register(
+        ModelType.RESTORER,
+        "gfpgan",
+        lambda: GFPGANRestorer(
+            upscale=settings.restore_upscale,
+            cache_dir=settings.model_cache_dir,
+        ),
     )
 
 

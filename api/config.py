@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     face_model_name: str = "buffalo_l"
     face_threshold: float = 0.6
 
+    # Restoration settings
+    restore_upscale: int = 2
+    restore_model: str = "realesrgan"
+    restore_max_input_size: int = 512  # Max px before downscaling (prevents OOM on CPU)
+
     # Processing settings
     max_image_size: int = 2048
     batch_size: int = 8

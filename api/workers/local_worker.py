@@ -246,6 +246,7 @@ class UnifiedWorker:
         asset_id = input_params.get('asset_id')
         image_url = input_params.get('image_url')
         operations = input_params.get('operations', ['embedding', 'faces', 'objects'])
+        restore_type = input_params.get('restore_type', 'both')
 
         try:
             # Load image
@@ -279,7 +280,8 @@ class UnifiedWorker:
                 operations=ops,
                 user_id=user_id,
                 store_results=True,
-                worker_id=self._worker_id
+                worker_id=self._worker_id,
+                restore_type=restore_type,
             )
 
             result['_meta'] = {
