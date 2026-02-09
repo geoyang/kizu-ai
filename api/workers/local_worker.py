@@ -9,6 +9,7 @@ Handles multiple job types:
 """
 
 import asyncio
+import base64
 import io
 import logging
 import os
@@ -539,7 +540,7 @@ class UnifiedWorker:
     async def _generate_and_upload_thumbnail(
         self, img: Image.Image, user_id: str, asset_id: str, temp_dir: str
     ) -> str:
-        """Generate and upload thumbnail."""
+        """Generate thumbnail and return as base64 data URI."""
         thumb = img.copy()
 
         # Center crop to square
@@ -561,9 +562,9 @@ class UnifiedWorker:
         thumb.save(buffer, format='JPEG', quality=THUMBNAIL_QUALITY)
         buffer.seek(0)
 
-        # Upload
-        upload_path = f"{user_id}/processed/{asset_id}/thumbnail.jpg"
-        return await self._upload_to_supabase(buffer.getvalue(), upload_path, "image/jpeg")
+        # Encode as base64 data URI
+        b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        return f"data:image/jpeg;base64,{b64}"
 
     async def _generate_and_upload_web_version(
         self, img: Image.Image, user_id: str, asset_id: str, temp_dir: str
