@@ -84,22 +84,5 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  deploy:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    environment: ${{ needs.build-and-push.outputs.environment }}
-
-    steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script: |
-            cd ${{ secrets.DEPLOY_PATH }}
-            export IMAGE_TAG=${{ needs.build-and-push.outputs.image-tag }}
-            docker compose -f docker-compose.prod.yml pull
-            docker compose -f docker-compose.prod.yml up -d
-            sleep 10
-            curl -f http://localhost:8000/health || echo "Health check failed — container may still be starting"
+  # Deploy is pull-based: the NAS runs a cron job that checks for new images.
+  # See scripts/deploy-pull.sh for the script to install on the deploy host.
