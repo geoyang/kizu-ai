@@ -1,0 +1,15 @@
+# Override for local builds instead of pulling from GHCR.
+# Usage: docker compose -f docker-compose.prod.yml -f docker-compose.build.yml up -d --build
+services:
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+  worker:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+  video-worker:
+    build:
+      context: .
+      dockerfile: api/Dockerfile

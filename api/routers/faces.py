@@ -436,7 +436,9 @@ async def run_backfill_thumbnails_task(
     from PIL import Image
     import httpx
     import io
+    import logging
 
+    logger = logging.getLogger(__name__)
     supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
 
     try:
@@ -451,6 +453,7 @@ async def run_backfill_thumbnails_task(
 
         faces_to_process = result.data or []
         total = len(faces_to_process)
+        logger.info(f"[backfill] {total} faces need thumbnails for user {user_id[:8]}")
 
         if total == 0:
             update_job(job_id, status="completed", progress=100, processed=0, total=0)
@@ -458,8 +461,39 @@ async def run_backfill_thumbnails_task(
 
         update_job(job_id, status="processing", progress=10, total=total)
 
+        # Batch-fetch asset URLs from the assets table (not album_assets,
+        # since not every asset is in an album)
+        unique_asset_ids = list(set(f["asset_id"] for f in faces_to_process))
+        logger.info(f"[backfill] Fetching URLs for {len(unique_asset_ids)} unique assets")
+
+        asset_url_cache: dict = {}
+        # Fetch in batches of 200 (Supabase IN query limit)
+        for i in range(0, len(unique_asset_ids), 200):
+            batch_ids = unique_asset_ids[i:i + 200]
+            asset_result = supabase.table("assets") \
+                .select("id, web_uri, path, media_type") \
+                .in_("id", batch_ids) \
+                .execute()
+            for row in (asset_result.data or []):
+                # Use web_uri (full-size public URL) since bounding boxes
+                # are in full-image pixel coordinates
+                url = row.get("web_uri") or row.get("path")
+                media_type = row.get("media_type", "")
+                if url and url.startswith("http"):
+                    asset_url_cache[row["id"]] = (url, media_type)
+
+        logger.info(f"[backfill] Found URLs for {len(asset_url_cache)}/{len(unique_asset_ids)} assets")
+
+        # Cache downloaded images (multiple faces per image)
+        image_cache: dict = {}
         processed = 0
-        async with httpx.AsyncClient() as client:
+        generated = 0
+        skipped_no_url = 0
+        skipped_video = 0
+        skipped_no_bbox = 0
+        errors = 0
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
             for face in faces_to_process:
                 try:
                     asset_id = face["asset_id"]
@@ -467,55 +501,54 @@ async def run_backfill_thumbnails_task(
                     bounding_box = face.get("bounding_box")
 
                     if not bounding_box:
+                        skipped_no_bbox += 1
                         processed += 1
                         continue
 
-                    # Get the asset URL from album_assets
-                    asset_result = supabase.table("album_assets") \
-                        .select("asset_uri, thumbnail_uri") \
-                        .eq("asset_id", asset_id) \
-                        .limit(1) \
-                        .execute()
-
-                    if not asset_result.data:
+                    if asset_id not in asset_url_cache:
+                        skipped_no_url += 1
                         processed += 1
                         continue
 
-                    image_url = asset_result.data[0].get("thumbnail_uri") or asset_result.data[0].get("asset_uri")
-                    if not image_url or not image_url.startswith("http"):
-                        processed += 1
-                        continue
+                    image_url, asset_type = asset_url_cache[asset_id]
 
                     # Skip videos
                     lower_url = image_url.lower()
-                    if any(lower_url.endswith(ext) for ext in ['.mov', '.mp4', '.avi', '.mkv', '.webm']):
-                        # Mark as from video
+                    is_video = (
+                        asset_type.startswith("video/") if asset_type else
+                        any(lower_url.endswith(ext) for ext in ['.mov', '.mp4', '.avi', '.mkv', '.webm'])
+                    )
+                    if is_video:
                         supabase.table("face_embeddings") \
                             .update({"is_from_video": True}) \
                             .eq("id", face["id"]) \
                             .execute()
+                        skipped_video += 1
                         processed += 1
                         continue
 
-                    # Download the image
-                    response = await client.get(image_url, timeout=30.0)
-                    if response.status_code != 200:
-                        processed += 1
-                        continue
+                    # Download image (cached per asset)
+                    if asset_id not in image_cache:
+                        response = await client.get(image_url)
+                        if response.status_code == 200:
+                            image_cache[asset_id] = response.content
+                        else:
+                            logger.warning(f"[backfill] HTTP {response.status_code} for asset {asset_id[:8]}")
+                            processed += 1
+                            errors += 1
+                            continue
 
-                    # Load image (thumbnails from storage are already EXIF-corrected)
-                    img = Image.open(io.BytesIO(response.content))
+                    img = Image.open(io.BytesIO(image_cache[asset_id]))
 
-                    # Parse bounding box
+                    # Parse bounding box (in full-image pixel coordinates)
                     x = bounding_box.get("x", 0)
                     y = bounding_box.get("y", 0)
                     width = bounding_box.get("width", 100)
                     height = bounding_box.get("height", 100)
 
                     # Add padding (30%)
-                    padding = 0.3
-                    pad_x = width * padding
-                    pad_y = height * padding
+                    pad_x = width * 0.3
+                    pad_y = height * 0.3
 
                     left = max(0, int(x - pad_x))
                     top = max(0, int(y - pad_y))
@@ -524,8 +557,6 @@ async def run_backfill_thumbnails_task(
 
                     # Crop
                     face_crop = img.crop((left, top, right, bottom))
-
-                    # Resize to thumbnail
                     face_crop.thumbnail((150, 150), Image.Resampling.LANCZOS)
 
                     # Convert to JPEG bytes
@@ -533,7 +564,6 @@ async def run_backfill_thumbnails_task(
                     if face_crop.mode in ('RGBA', 'P'):
                         face_crop = face_crop.convert('RGB')
                     face_crop.save(buffer, format='JPEG', quality=85)
-                    buffer.seek(0)
                     image_bytes = buffer.getvalue()
 
                     # Upload to storage
@@ -546,30 +576,39 @@ async def run_backfill_thumbnails_task(
 
                     # Get public URL and update database
                     public_url = supabase.storage.from_('face-thumbnails').get_public_url(filename)
-
                     supabase.table("face_embeddings") \
                         .update({"face_thumbnail_url": public_url}) \
                         .eq("id", face["id"]) \
                         .execute()
 
+                    generated += 1
                     processed += 1
 
-                    # Update progress every 5 faces
-                    if processed % 5 == 0:
+                    # Update progress every 10 faces
+                    if processed % 10 == 0:
                         progress = 10 + int((processed / total) * 85)
                         update_job(job_id, status="processing", progress=progress, processed=processed, total=total)
 
+                    # Evict image cache if it gets large (keep max 20 images in memory)
+                    if len(image_cache) > 20:
+                        oldest_key = next(iter(image_cache))
+                        del image_cache[oldest_key]
+
                 except Exception as e:
-                    import logging
-                    logging.error(f"Failed to process face {face.get('id')}: {e}")
+                    logger.error(f"[backfill] Failed face {face.get('id', '?')[:8]}: {e}")
+                    errors += 1
                     processed += 1
                     continue
 
+        logger.info(
+            f"[backfill] Done: {generated} generated, {skipped_no_url} no URL, "
+            f"{skipped_video} video, {skipped_no_bbox} no bbox, {errors} errors "
+            f"(total {processed}/{total})"
+        )
         update_job(job_id, status="completed", progress=100, processed=processed, total=total)
 
     except Exception as e:
-        import logging
-        logging.error(f"Backfill thumbnails failed: {e}")
+        logger.error(f"[backfill] Failed: {e}")
         update_job(job_id, status="failed", error_message=str(e))
 
 
