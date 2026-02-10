@@ -1,10 +1,6 @@
-version: '3.8'
-
 services:
   api:
-    build:
-      context: .
-      dockerfile: api/Dockerfile
+    image: ghcr.io/geoyang/kizu-ai:latest
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
     ports:
       - "8000:8000"
@@ -31,9 +27,7 @@ services:
           memory: 2G
 
   worker:
-    build:
-      context: .
-      dockerfile: api/Dockerfile
+    image: ghcr.io/geoyang/kizu-ai:latest
     command: python run_worker.py --poll-interval 5
     environment:
       - SUPABASE_URL=${SUPABASE_URL}
@@ -42,6 +36,21 @@ services:
       - MODEL_CACHE_DIR=/app/model_cache
     volumes:
       - model_cache:/app/model_cache
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+  video-worker:
+    image: ghcr.io/geoyang/kizu-ai:latest
+    command: python run_video_worker.py --poll-interval 10
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
     restart: unless-stopped
     deploy:
       resources:
