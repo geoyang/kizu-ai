@@ -632,7 +632,7 @@ class VideoService:
             )
 
             # Overlay: x drifts across full available width, y floats up
-            # Start at 80% of H (20% from top) so card is immediately readable
+            # Start at 20% from bottom (y = 0.8*H), float upward
             start_y = 0.8
             parts.append(
                 f'[{current}][{faded}]overlay='
