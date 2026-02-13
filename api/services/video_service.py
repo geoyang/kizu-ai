@@ -632,11 +632,13 @@ class VideoService:
             )
 
             # Overlay: x drifts across full available width, y floats up
+            # Start at 80% of H (20% from top) so card is immediately readable
+            start_y = 0.8
             parts.append(
                 f'[{current}][{faded}]overlay='
                 f'x={mid_x}+{drift_amp}*sin(t*{drift_speed:.1f}+{j * 2}):'
-                f'y=if(lt(t\\,{delay:.1f})\\,H\\,'
-                f'H-(H+h)*(t-{delay:.1f})/{rise_time:.1f}):'
+                f'y=if(lt(t\\,{delay:.1f})\\,{start_y}*H\\,'
+                f'{start_y}*H-({start_y}*H+h)*(t-{delay:.1f})/{rise_time:.1f}):'
                 f'shortest=1[{out}]'
             )
             current = out
