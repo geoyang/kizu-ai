@@ -830,8 +830,28 @@ class VideoService:
             cmd, capture_output=True, text=True, timeout=600
         )
         if result.returncode != 0:
+            logger.error(f'FFmpeg returncode: {result.returncode}')
             logger.error(f'FFmpeg stderr:\n{result.stderr}')
-            raise RuntimeError(f'FFmpeg failed: {result.stderr[-300:]}')
+            # Extract actual error lines (not progress) for the error message
+            error_lines = [
+                l for l in result.stderr.splitlines()
+                if any(k in l.lower() for k in [
+                    'error', 'invalid', 'no such', 'not found',
+                    'failed', 'unable', 'undefined', 'unknown',
+                ])
+            ]
+            if error_lines:
+                err_msg = '\n'.join(error_lines[-5:])
+            elif result.returncode < 0:
+                import signal as _sig
+                try:
+                    sig_name = _sig.Signals(-result.returncode).name
+                except (ValueError, AttributeError):
+                    sig_name = str(-result.returncode)
+                err_msg = f'FFmpeg killed by signal {sig_name} (likely OOM)'
+            else:
+                err_msg = result.stderr[-500:]
+            raise RuntimeError(f'FFmpeg failed (rc={result.returncode}): {err_msg}')
 
         on_progress('encoding_video', 80)
 
