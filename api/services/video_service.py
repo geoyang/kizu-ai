@@ -236,7 +236,7 @@ class VideoService:
         """Fetch album assets sorted by display order."""
         result = self._client.table('album_assets').select(
             'asset_id, display_order, assets(id, path, web_uri, thumbnail, media_type)'
-        ).eq('album_id', album_id).order('display_order').execute()
+        ).eq('album_id', album_id).order('display_order', desc=True).execute()
 
         assets = []
         for row in (result.data or []):
