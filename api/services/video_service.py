@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import httpx
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from supabase import Client
 
 logger = logging.getLogger(__name__)
@@ -266,8 +266,9 @@ class VideoService:
                 resp = await http.get(url)
                 resp.raise_for_status()
 
-                # Pre-resize large images to save FFmpeg memory
+                # Fix EXIF orientation and pre-resize to save FFmpeg memory
                 img = Image.open(io.BytesIO(resp.content))
+                img = ImageOps.exif_transpose(img)
                 w, h = img.size
                 if max(w, h) > max_dimension:
                     ratio = max_dimension / max(w, h)
