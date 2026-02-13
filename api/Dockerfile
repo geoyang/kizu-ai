@@ -18,6 +18,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     git \
     curl \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Fonts for FFmpeg drawtext (emoji reactions + memory text overlays)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fonts-noto-color-emoji \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Create app directory

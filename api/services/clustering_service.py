@@ -535,7 +535,7 @@ class ClusteringService:
                     break
 
                 result = self._store._client.table("face_embeddings") \
-                    .select("cluster_id, asset_id, face_index, face_thumbnail_url, is_from_video") \
+                    .select("cluster_id, asset_id, face_index, is_from_video") \
                     .in_("cluster_id", batch) \
                     .execute()
 
@@ -556,30 +556,23 @@ class ClusteringService:
                 faces_by_cluster[cid].append(row)
 
             result_map = {}
-            # Collect asset_ids that need fallback thumbnails
-            needs_fallback: list = []
+            all_asset_ids = set()
             for cid, faces in faces_by_cluster.items():
-                # Pick first face with a thumbnail, or first face
-                best = next(
-                    (f for f in faces if f.get("face_thumbnail_url")),
-                    faces[0] if faces else None
-                )
+                best = faces[0] if faces else None
                 if best:
                     result_map[cid] = {
                         "asset_id": best["asset_id"],
                         "face_index": best.get("face_index", 0),
-                        "thumbnail_url": best.get("face_thumbnail_url"),
+                        "thumbnail_url": None,
                         "is_from_video": best.get("is_from_video", False),
                     }
-                    if not best.get("face_thumbnail_url"):
-                        needs_fallback.append((cid, best["asset_id"]))
+                    all_asset_ids.add(best["asset_id"])
 
-            # Batch-fetch asset thumbnails for faces missing face_thumbnail_url
-            if needs_fallback:
-                fallback_asset_ids = list(set(aid for _, aid in needs_fallback))
+            # Batch-fetch asset thumbnails
+            if all_asset_ids:
                 asset_result = self._store._client.table("album_assets") \
                     .select("asset_id, asset_uri, thumbnail_uri, asset_type") \
-                    .in_("asset_id", fallback_asset_ids) \
+                    .in_("asset_id", list(all_asset_ids)) \
                     .execute()
 
                 asset_urls: dict = {}
@@ -598,9 +591,8 @@ class ClusteringService:
                             if any(lower.endswith(e) for e in ['.jpg', '.jpeg', '.png', '.webp', '.gif']):
                                 asset_urls[aid] = uri
 
-                for cid, aid in needs_fallback:
-                    if cid in result_map and not result_map[cid]["thumbnail_url"]:
-                        result_map[cid]["thumbnail_url"] = asset_urls.get(aid)
+                for cid, data in result_map.items():
+                    data["thumbnail_url"] = asset_urls.get(data["asset_id"])
 
             # Convert to SampleFace objects
             final_map = {}
@@ -623,15 +615,10 @@ class ClusteringService:
         cluster_id: str,
         limit: int = 4
     ) -> List[SampleFace]:
-        """Get sample faces for a cluster with thumbnail URLs.
-
-        Uses face_thumbnail_url from face_embeddings if available,
-        otherwise falls back to album_assets for legacy data.
-        """
+        """Get sample faces for a cluster with asset thumbnail URLs and bounding boxes."""
         try:
-            # Get face embeddings with thumbnail URLs
             result = self._store._client.table("face_embeddings") \
-                .select("asset_id, face_index, bounding_box, face_thumbnail_url, is_from_video") \
+                .select("asset_id, face_index, bounding_box, is_from_video") \
                 .eq("cluster_id", cluster_id) \
                 .limit(limit * 3) \
                 .execute()
@@ -639,36 +626,26 @@ class ClusteringService:
             if not result.data:
                 return []
 
-            # Separate faces with and without thumbnails
-            faces_with_thumbnails = []
-            faces_without_thumbnails = []
-
+            faces = []
             for row in result.data:
                 asset_id = row["asset_id"]
-                thumbnail_url = row.get("face_thumbnail_url")
-                is_from_video = row.get("is_from_video", False)
+                thumbnail_url = await self._get_asset_thumbnail(asset_id)
 
-                # If no face_thumbnail_url, try to get from album_assets (legacy fallback)
-                if not thumbnail_url:
-                    thumbnail_url = await self._get_asset_thumbnail(asset_id)
-
-                face = SampleFace(
+                faces.append(SampleFace(
                     asset_id=asset_id,
                     face_index=row.get("face_index", 0),
                     thumbnail_url=thumbnail_url,
-                    is_from_video=is_from_video
-                )
-
-                if thumbnail_url:
-                    faces_with_thumbnails.append(face)
-                else:
-                    faces_without_thumbnails.append(face)
+                    bounding_box=row.get("bounding_box"),
+                    is_from_video=row.get("is_from_video", False),
+                ))
 
             # Prioritize faces with thumbnails
-            sample_faces = faces_with_thumbnails[:limit]
+            with_thumbs = [f for f in faces if f.thumbnail_url]
+            without_thumbs = [f for f in faces if not f.thumbnail_url]
+            sample_faces = with_thumbs[:limit]
             remaining = limit - len(sample_faces)
             if remaining > 0:
-                sample_faces.extend(faces_without_thumbnails[:remaining])
+                sample_faces.extend(without_thumbs[:remaining])
 
             return sample_faces
 
@@ -722,9 +699,8 @@ class ClusteringService:
         await self._store.connect()
 
         try:
-            # Get all face embeddings for this cluster (include id for selection)
             result = self._store._client.table("face_embeddings") \
-                .select("id, asset_id, face_index, bounding_box, face_thumbnail_url, is_from_video") \
+                .select("id, asset_id, face_index, bounding_box, is_from_video") \
                 .eq("cluster_id", cluster_id) \
                 .eq("user_id", user_id) \
                 .execute()
@@ -732,46 +708,36 @@ class ClusteringService:
             if not result.data:
                 return []
 
-            # Collect asset_ids that need fallback thumbnails
-            missing_ids = set()
-            for row in result.data:
-                if not row.get("face_thumbnail_url"):
-                    missing_ids.add(row["asset_id"])
-
-            # Batch-fetch fallback thumbnails from album_assets
+            # Batch-fetch asset thumbnails
+            all_asset_ids = list(set(row["asset_id"] for row in result.data))
             asset_urls: dict = {}
-            if missing_ids:
-                asset_result = self._store._client.table("album_assets") \
-                    .select("asset_id, asset_uri, thumbnail_uri, asset_type") \
-                    .in_("asset_id", list(missing_ids)) \
-                    .execute()
-                if asset_result.data:
-                    for arow in asset_result.data:
-                        aid = arow["asset_id"]
-                        thumb = arow.get("thumbnail_uri")
-                        uri = arow.get("asset_uri")
-                        atype = arow.get("asset_type", "photo")
-                        if thumb and thumb.startswith("http"):
-                            asset_urls[aid] = thumb
-                        elif atype == "photo" and uri and uri.startswith("http"):
+            asset_result = self._store._client.table("album_assets") \
+                .select("asset_id, asset_uri, thumbnail_uri, asset_type") \
+                .in_("asset_id", all_asset_ids) \
+                .execute()
+            if asset_result.data:
+                for arow in asset_result.data:
+                    aid = arow["asset_id"]
+                    thumb = arow.get("thumbnail_uri")
+                    uri = arow.get("asset_uri")
+                    atype = arow.get("asset_type", "photo")
+                    if thumb and thumb.startswith("http"):
+                        asset_urls[aid] = thumb
+                    elif atype == "photo" and uri and uri.startswith("http"):
+                        asset_urls[aid] = uri
+                    elif uri and uri.startswith("http"):
+                        lower = uri.lower()
+                        if any(lower.endswith(e) for e in ['.jpg', '.jpeg', '.png', '.webp', '.gif']):
                             asset_urls[aid] = uri
-                        elif uri and uri.startswith("http"):
-                            lower = uri.lower()
-                            if any(lower.endswith(e) for e in ['.jpg', '.jpeg', '.png', '.webp', '.gif']):
-                                asset_urls[aid] = uri
 
             faces = []
             for row in result.data:
                 asset_id = row["asset_id"]
-                thumbnail_url = row.get("face_thumbnail_url")
-                if not thumbnail_url:
-                    thumbnail_url = asset_urls.get(asset_id)
-
                 faces.append({
                     "id": row["id"],
                     "asset_id": asset_id,
                     "face_index": row.get("face_index", 0),
-                    "thumbnail_url": thumbnail_url,
+                    "thumbnail_url": asset_urls.get(asset_id),
                     "is_from_video": row.get("is_from_video", False),
                     "bounding_box": row.get("bounding_box")
                 })

@@ -4,6 +4,7 @@ Handles multiple job types:
 - ai_processing_jobs table:
   - Image AI processing (embeddings, faces, objects) - default
   - Moments generation (generate_moments job_type)
+  - Album video generation (album_video job_type)
 - image_processing_jobs table:
   - Thumbnail and web version generation
 """
@@ -133,7 +134,7 @@ class UnifiedWorker:
 
         try:
             while self._running:
-                # Poll AI processing jobs
+                # Poll AI processing jobs (includes album_video job type)
                 await self._poll_ai_jobs()
 
                 # Poll image processing jobs
@@ -245,6 +246,8 @@ class UnifiedWorker:
 
         if job_type == 'generate_moments':
             await self._process_moments_job(job)
+        elif job_type == 'album_video':
+            await self._process_video_job(job)
         else:
             await self._process_image_ai_job(job)
 
@@ -809,6 +812,38 @@ class UnifiedWorker:
         except Exception as e:
             logger.error(f"Failed to load asset image {asset_id}: {e}")
             return None
+
+    # =========================================================================
+    # Album Video Jobs (job_type='album_video' in ai_processing_jobs)
+    # =========================================================================
+
+    async def _process_video_job(self, job: dict) -> None:
+        """Process album video generation job using FFmpeg."""
+        from api.services.video_service import VideoService
+
+        job_id = job['id']
+        user_id = job['user_id']
+        params = job.get('input_params') or {}
+        album_id = params.get('album_id')
+
+        def on_progress(step: str, percent: int):
+            self._update_ai_job_progress(job_id, percent, step)
+
+        try:
+            video_service = VideoService(self._client)
+            result = await video_service.generate(
+                album_id=album_id,
+                user_id=user_id,
+                config=params,
+                on_progress=on_progress,
+            )
+
+            self._complete_ai_job(job_id, result)
+            logger.info(f"Completed video job {job_id} for album {album_id}")
+
+        except Exception as e:
+            logger.error(f"Video job {job_id} failed: {e}", exc_info=True)
+            self._fail_ai_job(job_id, str(e)[:500])
 
     def _handle_shutdown(self, signum, frame) -> None:
         """Handle shutdown signal."""

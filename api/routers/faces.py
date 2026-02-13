@@ -293,7 +293,7 @@ async def get_contact_images(
 
         if cluster_ids:
             faces_result = supabase.table("face_embeddings") \
-                .select("asset_id, face_thumbnail_url") \
+                .select("asset_id") \
                 .eq("user_id", user_id) \
                 .in_("cluster_id", cluster_ids) \
                 .execute()
@@ -303,7 +303,7 @@ async def get_contact_images(
 
         # Also check for direct contact_id assignment on face_embeddings
         direct_faces_result = supabase.table("face_embeddings") \
-            .select("asset_id, face_thumbnail_url") \
+            .select("asset_id") \
             .eq("user_id", user_id) \
             .eq("contact_id", contact_id) \
             .execute()
@@ -353,7 +353,6 @@ async def get_contact_images(
 
 @router.post("/clear-clustering")
 async def clear_clustering(
-    clear_thumbnails: bool = False,
     clustering_service: ClusteringService = Depends(get_clustering_service),
     user_id: str = Depends(get_current_user_id)
 ):
@@ -363,9 +362,8 @@ async def clear_clustering(
     This will:
     - Delete all face clusters
     - Clear cluster_id from all face embeddings (preserves contact_id)
-    - Optionally clear face thumbnails (if clear_thumbnails=True)
 
-    After clearing, you can re-run clustering and backfill thumbnails.
+    After clearing, you can re-run clustering.
     """
     from api.config import settings
     from supabase import create_client
@@ -380,236 +378,20 @@ async def clear_clustering(
             .execute()
 
         # Clear cluster assignments from face embeddings
-        update_data = {"cluster_id": None}
-        if clear_thumbnails:
-            update_data["face_thumbnail_url"] = None
-
         supabase.table("face_embeddings") \
-            .update(update_data) \
+            .update({"cluster_id": None}) \
             .eq("user_id", user_id) \
             .execute()
 
         return {
             "status": "cleared",
-            "message": "All clustering data has been cleared" + (" (including thumbnails)" if clear_thumbnails else ""),
+            "message": "All clustering data has been cleared",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/backfill-thumbnails")
-async def backfill_face_thumbnails(
-    background_tasks: BackgroundTasks,
-    clustering_service: ClusteringService = Depends(get_clustering_service),
-    user_id: str = Depends(get_current_user_id)
-):
-    """Generate face thumbnails for existing face embeddings that don't have them."""
-    from datetime import datetime
-    from api.routers.jobs import create_job
 
-    job_id = str(uuid.uuid4())
-    create_job(job_id, user_id, "backfill_thumbnails", total=0)
-
-    background_tasks.add_task(
-        run_backfill_thumbnails_task,
-        job_id=job_id,
-        user_id=user_id,
-        clustering_service=clustering_service
-    )
-
-    return {
-        "status": "started",
-        "job_id": job_id,
-        "message": "Backfilling face thumbnails in background"
-    }
-
-
-async def run_backfill_thumbnails_task(
-    job_id: str,
-    user_id: str,
-    clustering_service: ClusteringService
-):
-    """Background task to generate face thumbnails for existing embeddings."""
-    from api.routers.jobs import update_job
-    from api.config import settings
-    from supabase import create_client
-    from PIL import Image
-    import httpx
-    import io
-    import logging
-
-    logger = logging.getLogger(__name__)
-    supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
-
-    try:
-        update_job(job_id, status="processing", progress=5)
-
-        # Get all face embeddings without thumbnails
-        result = supabase.table("face_embeddings") \
-            .select("id, asset_id, face_index, bounding_box, face_thumbnail_url") \
-            .eq("user_id", user_id) \
-            .is_("face_thumbnail_url", "null") \
-            .execute()
-
-        faces_to_process = result.data or []
-        total = len(faces_to_process)
-        logger.info(f"[backfill] {total} faces need thumbnails for user {user_id[:8]}")
-
-        if total == 0:
-            update_job(job_id, status="completed", progress=100, processed=0, total=0)
-            return
-
-        update_job(job_id, status="processing", progress=10, total=total)
-
-        # Batch-fetch asset URLs from the assets table (not album_assets,
-        # since not every asset is in an album)
-        unique_asset_ids = list(set(f["asset_id"] for f in faces_to_process))
-        logger.info(f"[backfill] Fetching URLs for {len(unique_asset_ids)} unique assets")
-
-        asset_url_cache: dict = {}
-        # Fetch in batches of 200 (Supabase IN query limit)
-        for i in range(0, len(unique_asset_ids), 200):
-            batch_ids = unique_asset_ids[i:i + 200]
-            asset_result = supabase.table("assets") \
-                .select("id, web_uri, path, media_type") \
-                .in_("id", batch_ids) \
-                .execute()
-            for row in (asset_result.data or []):
-                # Use web_uri (full-size public URL) since bounding boxes
-                # are in full-image pixel coordinates
-                url = row.get("web_uri") or row.get("path")
-                media_type = row.get("media_type", "")
-                if url and url.startswith("http"):
-                    asset_url_cache[row["id"]] = (url, media_type)
-
-        logger.info(f"[backfill] Found URLs for {len(asset_url_cache)}/{len(unique_asset_ids)} assets")
-
-        # Cache downloaded images (multiple faces per image)
-        image_cache: dict = {}
-        processed = 0
-        generated = 0
-        skipped_no_url = 0
-        skipped_video = 0
-        skipped_no_bbox = 0
-        errors = 0
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            for face in faces_to_process:
-                try:
-                    asset_id = face["asset_id"]
-                    face_index = face["face_index"]
-                    bounding_box = face.get("bounding_box")
-
-                    if not bounding_box:
-                        skipped_no_bbox += 1
-                        processed += 1
-                        continue
-
-                    if asset_id not in asset_url_cache:
-                        skipped_no_url += 1
-                        processed += 1
-                        continue
-
-                    image_url, asset_type = asset_url_cache[asset_id]
-
-                    # Skip videos
-                    lower_url = image_url.lower()
-                    is_video = (
-                        asset_type.startswith("video/") if asset_type else
-                        any(lower_url.endswith(ext) for ext in ['.mov', '.mp4', '.avi', '.mkv', '.webm'])
-                    )
-                    if is_video:
-                        supabase.table("face_embeddings") \
-                            .update({"is_from_video": True}) \
-                            .eq("id", face["id"]) \
-                            .execute()
-                        skipped_video += 1
-                        processed += 1
-                        continue
-
-                    # Download image (cached per asset)
-                    if asset_id not in image_cache:
-                        response = await client.get(image_url)
-                        if response.status_code == 200:
-                            image_cache[asset_id] = response.content
-                        else:
-                            logger.warning(f"[backfill] HTTP {response.status_code} for asset {asset_id[:8]}")
-                            processed += 1
-                            errors += 1
-                            continue
-
-                    img = Image.open(io.BytesIO(image_cache[asset_id]))
-
-                    # Parse bounding box (in full-image pixel coordinates)
-                    x = bounding_box.get("x", 0)
-                    y = bounding_box.get("y", 0)
-                    width = bounding_box.get("width", 100)
-                    height = bounding_box.get("height", 100)
-
-                    # Add padding (30%)
-                    pad_x = width * 0.3
-                    pad_y = height * 0.3
-
-                    left = max(0, int(x - pad_x))
-                    top = max(0, int(y - pad_y))
-                    right = min(img.width, int(x + width + pad_x))
-                    bottom = min(img.height, int(y + height + pad_y))
-
-                    # Crop
-                    face_crop = img.crop((left, top, right, bottom))
-                    face_crop.thumbnail((150, 150), Image.Resampling.LANCZOS)
-
-                    # Convert to JPEG bytes
-                    buffer = io.BytesIO()
-                    if face_crop.mode in ('RGBA', 'P'):
-                        face_crop = face_crop.convert('RGB')
-                    face_crop.save(buffer, format='JPEG', quality=85)
-                    image_bytes = buffer.getvalue()
-
-                    # Upload to storage
-                    filename = f"{user_id}/{asset_id}_{face_index}.jpg"
-                    supabase.storage.from_('face-thumbnails').upload(
-                        filename,
-                        image_bytes,
-                        file_options={"content-type": "image/jpeg", "upsert": "true"}
-                    )
-
-                    # Get public URL and update database
-                    public_url = supabase.storage.from_('face-thumbnails').get_public_url(filename)
-                    supabase.table("face_embeddings") \
-                        .update({"face_thumbnail_url": public_url}) \
-                        .eq("id", face["id"]) \
-                        .execute()
-
-                    generated += 1
-                    processed += 1
-
-                    # Update progress every 10 faces
-                    if processed % 10 == 0:
-                        progress = 10 + int((processed / total) * 85)
-                        update_job(job_id, status="processing", progress=progress, processed=processed, total=total)
-
-                    # Evict image cache if it gets large (keep max 20 images in memory)
-                    if len(image_cache) > 20:
-                        oldest_key = next(iter(image_cache))
-                        del image_cache[oldest_key]
-
-                except Exception as e:
-                    logger.error(f"[backfill] Failed face {face.get('id', '?')[:8]}: {e}")
-                    errors += 1
-                    processed += 1
-                    continue
-
-        logger.info(
-            f"[backfill] Done: {generated} generated, {skipped_no_url} no URL, "
-            f"{skipped_video} video, {skipped_no_bbox} no bbox, {errors} errors "
-            f"(total {processed}/{total})"
-        )
-        update_job(job_id, status="completed", progress=100, processed=processed, total=total)
-
-    except Exception as e:
-        logger.error(f"[backfill] Failed: {e}")
-        update_job(job_id, status="failed", error_message=str(e))
 
 
 @router.post("/tag-sync/preview", response_model=TagSyncPreviewResponse)
