@@ -5,6 +5,7 @@ between them, overlays memories/reactions text, adds background music,
 and produces an MP4 video.
 """
 
+import io
 import logging
 import os
 import random
@@ -249,23 +250,31 @@ class VideoService:
         return assets
 
     async def _download_assets(
-        self, assets: list[dict], tmp_path: Path, on_progress: Callable
+        self, assets: list[dict], tmp_path: Path, on_progress: Callable,
+        max_dimension: int = 2400,
     ) -> list[Path]:
-        """Download all asset images to temp directory."""
+        """Download all asset images and pre-resize to limit FFmpeg memory."""
         paths = []
         total = len(assets)
         async with httpx.AsyncClient(timeout=30.0) as http:
             for i, asset in enumerate(assets):
                 url = asset['url']
                 if not url.startswith('http'):
-                    # Construct full URL from storage path
                     url = self._client.storage.from_('assets').get_public_url(url)
 
-                ext = '.jpg'
-                out_path = tmp_path / f'img_{i:04d}{ext}'
+                out_path = tmp_path / f'img_{i:04d}.jpg'
                 resp = await http.get(url)
                 resp.raise_for_status()
-                out_path.write_bytes(resp.content)
+
+                # Pre-resize large images to save FFmpeg memory
+                img = Image.open(io.BytesIO(resp.content))
+                w, h = img.size
+                if max(w, h) > max_dimension:
+                    ratio = max_dimension / max(w, h)
+                    img = img.resize(
+                        (round(w * ratio), round(h * ratio)), Image.LANCZOS
+                    )
+                img.save(out_path, 'JPEG', quality=92)
                 paths.append(out_path)
 
                 pct = 10 + int(20 * (i + 1) / total)
