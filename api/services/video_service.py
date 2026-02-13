@@ -486,7 +486,7 @@ class VideoService:
             # Render at native bitmap size (136x128 glyph)
             canvas = Image.new('RGBA', (150, 150), (0, 0, 0, 0))
             draw = ImageDraw.Draw(canvas)
-            draw.text((7, 7), emoji_char, font=font)
+            draw.text((7, 7), emoji_char, font=font, embedded_color=True)
             # Crop to content
             bbox = canvas.getbbox()
             if bbox:
