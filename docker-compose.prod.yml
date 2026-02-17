@@ -1,6 +1,9 @@
 services:
   api:
-    image: ghcr.io/geoyang/kizu-ai:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    image: kizu-ai:latest
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
     ports:
       - "8000:8000"
@@ -27,7 +30,7 @@ services:
           memory: 2G
 
   worker:
-    image: ghcr.io/geoyang/kizu-ai:${IMAGE_TAG:-latest}
+    image: kizu-ai:latest
     command: python run_worker.py --poll-interval 5
     environment:
       - SUPABASE_URL=${SUPABASE_URL}
@@ -45,7 +48,7 @@ services:
           memory: 2G
 
   video-worker:
-    image: ghcr.io/geoyang/kizu-ai:${IMAGE_TAG:-latest}
+    image: kizu-ai:latest
     command: python run_video_worker.py --poll-interval 10
     environment:
       - SUPABASE_URL=${SUPABASE_URL}
