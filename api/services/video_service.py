@@ -57,57 +57,151 @@ class VideoService:
             self._face_model = InsightFaceModel()
         return self._face_model
 
+    def _fetch_stored_face_boxes(self, asset_ids: list[str]) -> dict[str, list[dict]]:
+        """Batch-fetch stored face bounding boxes from face_embeddings.
+
+        Returns {asset_id: [{x, y, width, height}, ...]}.
+        """
+        if not asset_ids:
+            return {}
+        result = self._client.table('face_embeddings').select(
+            'asset_id, bounding_box'
+        ).in_('asset_id', asset_ids).not_.is_('bounding_box', 'null').execute()
+
+        boxes: dict[str, list[dict]] = {}
+        for row in (result.data or []):
+            aid = row['asset_id']
+            bb = row.get('bounding_box')
+            if bb and bb.get('width', 0) > 0 and bb.get('height', 0) > 0:
+                boxes.setdefault(aid, []).append(bb)
+        return boxes
+
     def _compute_face_crop(
         self, image_path: Path, target_w: int = OUT_W, target_h: int = OUT_H,
-    ) -> tuple[int, int]:
-        """Detect faces and compute crop offset that keeps faces visible.
+        stored_boxes: list[dict] | None = None,
+    ) -> tuple[int, int, int, int]:
+        """Detect faces and compute crop offset that keeps ALL faces visible.
 
-        Returns (crop_x, crop_y) for FFmpeg crop=OUT_W:OUT_H:x:y after
-        scaling the image up to cover target_w x target_h.
+        Merges stored bounding boxes (from people tags) with auto-detected
+        faces. If the combined face region is too large for the crop window,
+        zooms out (increases scale dimensions) to fit all faces.
+
+        Returns (crop_x, crop_y, scale_w, scale_h).
         """
         try:
             img = Image.open(image_path)
             w, h = img.size
 
-            # Calculate scaled dimensions (same as force_original_aspect_ratio=increase)
-            scale = max(target_w / w, target_h / h)
-            scaled_w = round(w * scale)
-            scaled_h = round(h * scale)
+            # Collect all face boxes in original image coordinates
+            all_boxes = list(stored_boxes or [])
 
-            # Detect faces on original image
-            model = self._get_face_model()
-            result = model.detect_faces(img, min_face_size=20)
+            # Auto-detect faces
+            try:
+                model = self._get_face_model()
+                result = model.detect_faces(img, min_face_size=20)
+                for f in (result.faces or []):
+                    bb = f.bounding_box
+                    all_boxes.append({
+                        'x': bb.x, 'y': bb.y,
+                        'width': bb.width, 'height': bb.height,
+                    })
+            except Exception as e:
+                logger.warning(f'Face detection failed for {image_path}: {e}')
 
-            if not result.faces:
+            # Deduplicate overlapping boxes (stored vs detected)
+            all_boxes = self._deduplicate_face_boxes(all_boxes)
+
+            # Default cover scale
+            cover_scale = max(target_w / w, target_h / h)
+            scale_w = round(w * cover_scale)
+            scale_h = round(h * cover_scale)
+
+            if not all_boxes:
                 # No faces: center crop
-                return (scaled_w - OUT_W) // 2, (scaled_h - OUT_H) // 2
+                cx = (scale_w - OUT_W) // 2
+                cy = (scale_h - OUT_H) // 2
+                return cx, cy, scale_w, scale_h
 
-            # Compute bounding box around all faces (in original image coords)
-            face_min_x = min(f.bounding_box.x for f in result.faces)
-            face_min_y = min(f.bounding_box.y for f in result.faces)
-            face_max_x = max(f.bounding_box.x + f.bounding_box.width for f in result.faces)
-            face_max_y = max(f.bounding_box.y + f.bounding_box.height for f in result.faces)
+            # Union bounding box of all faces (original coords) with padding
+            padding = 0.15  # 15% padding around face region
+            face_min_x = min(b['x'] for b in all_boxes)
+            face_min_y = min(b['y'] for b in all_boxes)
+            face_max_x = max(b['x'] + b['width'] for b in all_boxes)
+            face_max_y = max(b['y'] + b['height'] for b in all_boxes)
 
-            # Face center in original coords, then scale to output coords
-            face_cx = (face_min_x + face_max_x) / 2 * scale
-            face_cy = (face_min_y + face_max_y) / 2 * scale
+            face_w = face_max_x - face_min_x
+            face_h = face_max_y - face_min_y
+            pad_x = face_w * padding
+            pad_y = face_h * padding
+            face_min_x = max(0, face_min_x - pad_x)
+            face_min_y = max(0, face_min_y - pad_y)
+            face_max_x = min(w, face_max_x + pad_x)
+            face_max_y = min(h, face_max_y + pad_y)
 
-            # Compute crop origin centered on faces, clamped to valid range
-            crop_x = int(max(0, min(face_cx - OUT_W / 2, scaled_w - OUT_W)))
-            crop_y = int(max(0, min(face_cy - OUT_H / 2, scaled_h - OUT_H)))
+            # Check if face region fits in crop at current scale
+            face_region_w = (face_max_x - face_min_x) * cover_scale
+            face_region_h = (face_max_y - face_min_y) * cover_scale
 
-            return crop_x, crop_y
+            if face_region_w > OUT_W or face_region_h > OUT_H:
+                # Need to zoom out — find scale where face region fits in output
+                needed_scale = min(
+                    OUT_W / (face_max_x - face_min_x),
+                    OUT_H / (face_max_y - face_min_y),
+                )
+                # Use whichever is smaller, but ensure we still cover output
+                if needed_scale < cover_scale:
+                    # Scale down — image may not cover output, pad with black
+                    scale_w = round(w * needed_scale)
+                    scale_h = round(h * needed_scale)
+                    # Ensure at least output size (pad handled by FFmpeg pad filter)
+                    actual_scale = needed_scale
+                else:
+                    actual_scale = cover_scale
+            else:
+                actual_scale = cover_scale
+
+            # Face center in scaled coords
+            face_cx = ((face_min_x + face_max_x) / 2) * actual_scale
+            face_cy = ((face_min_y + face_max_y) / 2) * actual_scale
+
+            # Crop origin centered on all faces, clamped to valid range
+            crop_x = int(max(0, min(face_cx - OUT_W / 2, scale_w - OUT_W)))
+            crop_y = int(max(0, min(face_cy - OUT_H / 2, scale_h - OUT_H)))
+
+            return crop_x, crop_y, scale_w, scale_h
 
         except Exception as e:
-            logger.warning(f'Face detection failed for {image_path}: {e}')
-            # Fallback: center crop
+            logger.warning(f'Face crop computation failed for {image_path}: {e}')
             try:
                 img = Image.open(image_path)
-                scale = max(target_w / img.width, target_h / img.height)
-                sw, sh = round(img.width * scale), round(img.height * scale)
-                return (sw - OUT_W) // 2, (sh - OUT_H) // 2
+                s = max(target_w / img.width, target_h / img.height)
+                sw, sh = round(img.width * s), round(img.height * s)
+                return (sw - OUT_W) // 2, (sh - OUT_H) // 2, sw, sh
             except Exception:
-                return 0, 0
+                return 0, 0, target_w, target_h
+
+    @staticmethod
+    def _deduplicate_face_boxes(boxes: list[dict]) -> list[dict]:
+        """Remove near-duplicate boxes (IoU > 0.5)."""
+        if len(boxes) <= 1:
+            return boxes
+
+        def iou(a: dict, b: dict) -> float:
+            ax1, ay1 = a['x'], a['y']
+            ax2, ay2 = ax1 + a['width'], ay1 + a['height']
+            bx1, by1 = b['x'], b['y']
+            bx2, by2 = bx1 + b['width'], by1 + b['height']
+            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            union = a['width'] * a['height'] + b['width'] * b['height'] - inter
+            return inter / union if union > 0 else 0
+
+        kept = [boxes[0]]
+        for b in boxes[1:]:
+            if all(iou(b, k) < 0.5 for k in kept):
+                kept.append(b)
+        return kept
 
     async def generate(
         self,
@@ -156,9 +250,18 @@ class VideoService:
             kb_factor = KB_FACTORS.get(ken_burns, 0.05)
             kb_w = round(OUT_W * (1 + kb_factor))
             kb_h = round(OUT_H * (1 + kb_factor))
+
+            # Fetch stored face bounding boxes (from people tags)
+            asset_ids_list = [a['id'] for a in assets]
+            stored_face_boxes = self._fetch_stored_face_boxes(asset_ids_list)
+
             crop_offsets = []
-            for path in image_paths:
-                crop_offsets.append(self._compute_face_crop(path, kb_w, kb_h))
+            for i, path in enumerate(image_paths):
+                aid = assets[i]['id'] if i < len(assets) else ''
+                boxes = stored_face_boxes.get(aid, [])
+                crop_offsets.append(
+                    self._compute_face_crop(path, kb_w, kb_h, stored_boxes=boxes)
+                )
 
             # 3b. Download music if provided
             music_path = None
@@ -775,7 +878,7 @@ class VideoService:
         music_path: Optional[Path],
         overlays: dict,
         asset_ids: list[str],
-        crop_offsets: list[tuple[int, int]],
+        crop_offsets: list[tuple[int, int, int, int]],
         memory_cards: dict[str, list[Path]],
         reaction_pngs: dict[str, list[Path]] | None = None,
         ken_burns: str = 'mild',
@@ -786,13 +889,15 @@ class VideoService:
         For large albums (> MAX_BATCH_SIZE), splits into batches, renders
         each separately, then concatenates to avoid FFmpeg OOM.
 
+        crop_offsets: list of (crop_x, crop_y, scale_w, scale_h) per image.
+
         Returns video duration in seconds.
         """
         if len(image_paths) == 0:
             raise ValueError('No images to render')
 
         if len(image_paths) == 1:
-            cx, cy = crop_offsets[0] if crop_offsets else (0, 0)
+            cx, cy, sw, sh = crop_offsets[0] if crop_offsets else (0, 0, OUT_W, OUT_H)
             return self._render_single_image(
                 image_paths[0], output_path, photo_duration, music_path, cx, cy
             )
@@ -837,7 +942,7 @@ class VideoService:
         music_path: Optional[Path],
         overlays: dict,
         asset_ids: list[str],
-        crop_offsets: list[tuple[int, int]],
+        crop_offsets: list[tuple[int, int, int, int]],
         memory_cards: dict[str, list[Path]],
         reaction_pngs: dict[str, list[Path]] | None = None,
         ken_burns: str = 'mild',
@@ -855,22 +960,25 @@ class VideoService:
         tmp_dir = output_path.parent
         clip_paths: list[Path] = []
         kb_factor = KB_FACTORS.get(ken_burns, 0.0)
-        kb_w = round(OUT_W * (1 + kb_factor))
-        kb_h = round(OUT_H * (1 + kb_factor))
         fade_dur = min(0.5, photo_duration / 4)
 
         for i in range(n):
             clip_path = tmp_dir / f'clip_{i:04d}.mp4'
-            cx, cy = crop_offsets[i] if i < len(crop_offsets) else (0, 0)
+            cx, cy, img_sw, img_sh = crop_offsets[i] if i < len(crop_offsets) else (0, 0, OUT_W, OUT_H)
             aid = asset_ids[i] if i < len(asset_ids) else ''
+
+            # Per-image scale (may differ if zoomed out for faces)
+            needs_pad = img_sw < OUT_W or img_sh < OUT_H
+            scale_w = max(img_sw, OUT_W)
+            scale_h = max(img_sh, OUT_H)
 
             inputs = ['-loop', '1', '-t', str(photo_duration), '-i', str(image_paths[i])]
             filter_parts = []
 
             # Scale + crop (with Ken Burns if enabled)
             if kb_factor > 0:
-                margin_x = max(kb_w - OUT_W, 0)
-                margin_y = max(kb_h - OUT_H, 0)
+                margin_x = max(scale_w - OUT_W, 0)
+                margin_y = max(scale_h - OUT_H, 0)
                 # Start centered on faces, drift slightly outward
                 face_x = max(0, min(cx, margin_x))
                 face_y = max(0, min(cy, margin_y))
@@ -881,18 +989,29 @@ class VideoService:
                 end_y = int(face_y + 0.2 * (center_y - face_y))
                 end_x = max(0, min(end_x, margin_x))
                 end_y = max(0, min(end_y, margin_y))
+
+                scale_filter = (
+                    f'[0:v]scale={scale_w}:{scale_h}:'
+                    f'force_original_aspect_ratio=increase'
+                )
+                if needs_pad:
+                    scale_filter += f',pad={scale_w}:{scale_h}:(ow-iw)/2:(oh-ih)/2:black'
                 filter_parts.append(
-                    f'[0:v]scale={kb_w}:{kb_h}:'
-                    f'force_original_aspect_ratio=increase,'
+                    f'{scale_filter},'
                     f'crop={OUT_W}:{OUT_H}:'
                     f'{face_x}+({end_x}-{face_x})*t/{photo_duration:.1f}:'
                     f'{face_y}+({end_y}-{face_y})*t/{photo_duration:.1f},'
                     f'setsar=1,fps=30[base]'
                 )
             else:
+                scale_filter = (
+                    f'[0:v]scale={scale_w}:{scale_h}:'
+                    f'force_original_aspect_ratio=increase'
+                )
+                if needs_pad:
+                    scale_filter += f',pad={scale_w}:{scale_h}:(ow-iw)/2:(oh-ih)/2:black'
                 filter_parts.append(
-                    f'[0:v]scale={OUT_W}:{OUT_H}:'
-                    f'force_original_aspect_ratio=increase,'
+                    f'{scale_filter},'
                     f'crop={OUT_W}:{OUT_H}:{cx}:{cy},'
                     f'setsar=1,fps=30[base]'
                 )
@@ -1032,7 +1151,7 @@ class VideoService:
         music_path: Optional[Path],
         overlays: dict,
         asset_ids: list[str],
-        crop_offsets: list[tuple[int, int]],
+        crop_offsets: list[tuple[int, int, int, int]],
         memory_cards: dict[str, list[Path]],
         reaction_pngs: dict[str, list[Path]] | None = None,
         ken_burns: str = 'mild',
@@ -1051,7 +1170,7 @@ class VideoService:
         effective_music = music_for_single or music_path
 
         if n == 1:
-            cx, cy = crop_offsets[0] if crop_offsets else (0, 0)
+            cx, cy, sw, sh = crop_offsets[0] if crop_offsets else (0, 0, OUT_W, OUT_H)
             return self._render_single_image(
                 image_paths[0], output_path, photo_duration, effective_music, cx, cy
             )
@@ -1103,17 +1222,20 @@ class VideoService:
 
         # Scale all inputs with face-aware crop + optional Ken Burns pan
         kb_factor = KB_FACTORS.get(ken_burns, 0.0)
-        kb_w = round(OUT_W * (1 + kb_factor))
-        kb_h = round(OUT_H * (1 + kb_factor))
 
         for i in range(n):
-            cx, cy = crop_offsets[i] if i < len(crop_offsets) else (0, 0)
+            cx, cy, img_sw, img_sh = crop_offsets[i] if i < len(crop_offsets) else (0, 0, OUT_W, OUT_H)
             scale_label = f'sc{i}'
 
+            # Per-image scale (may differ if zoomed out for faces)
+            needs_pad = img_sw < OUT_W or img_sh < OUT_H
+            scale_w = max(img_sw, OUT_W)
+            scale_h = max(img_sh, OUT_H)
+
             if kb_factor > 0:
-                # Ken Burns: scale larger, animated crop starting on faces
-                margin_x = max(kb_w - OUT_W, 0)
-                margin_y = max(kb_h - OUT_H, 0)
+                # Ken Burns: animated crop starting on faces
+                margin_x = max(scale_w - OUT_W, 0)
+                margin_y = max(scale_h - OUT_H, 0)
 
                 # Start centered on faces
                 face_x = max(0, min(cx, margin_x))
@@ -1127,9 +1249,14 @@ class VideoService:
                 end_x = max(0, min(end_x, margin_x))
                 end_y = max(0, min(end_y, margin_y))
 
+                scale_filter = (
+                    f'[{i}:v]scale={scale_w}:{scale_h}:'
+                    f'force_original_aspect_ratio=increase'
+                )
+                if needs_pad:
+                    scale_filter += f',pad={scale_w}:{scale_h}:(ow-iw)/2:(oh-ih)/2:black'
                 filter_parts.append(
-                    f'[{i}:v]scale={kb_w}:{kb_h}:'
-                    f'force_original_aspect_ratio=increase,'
+                    f'{scale_filter},'
                     f'crop={OUT_W}:{OUT_H}:'
                     f'{face_x}+({end_x}-{face_x})*t/{photo_duration:.1f}:'
                     f'{face_y}+({end_y}-{face_y})*t/{photo_duration:.1f},'
@@ -1137,9 +1264,14 @@ class VideoService:
                 )
             else:
                 # No Ken Burns: static crop
+                scale_filter = (
+                    f'[{i}:v]scale={scale_w}:{scale_h}:'
+                    f'force_original_aspect_ratio=increase'
+                )
+                if needs_pad:
+                    scale_filter += f',pad={scale_w}:{scale_h}:(ow-iw)/2:(oh-ih)/2:black'
                 filter_parts.append(
-                    f'[{i}:v]scale={OUT_W}:{OUT_H}:'
-                    f'force_original_aspect_ratio=increase,'
+                    f'{scale_filter},'
                     f'crop={OUT_W}:{OUT_H}:{cx}:{cy},'
                     f'setsar=1,fps=30[{scale_label}]'
                 )
