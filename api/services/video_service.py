@@ -198,7 +198,7 @@ class VideoService:
                 on_progress=on_progress,
             )
 
-            # 6. Upload to Supabase storage
+            # 6. Upload video to Supabase storage
             on_progress('uploading', 85)
             storage_path = f'{user_id}/album_videos/{album_id}.mp4'
             with open(output_path, 'rb') as f:
@@ -212,17 +212,41 @@ class VideoService:
 
             public_url = self._client.storage.from_('assets').get_public_url(storage_path)
 
+            # 6b. Generate and upload thumbnail collage from album photos
+            on_progress('uploading', 90)
+            thumbnail_url = None
+            try:
+                collage_path = tmp_path / 'thumbnail.jpg'
+                self._generate_thumbnail_collage(image_paths[:5], collage_path)
+                thumb_storage_path = f'{user_id}/album_videos/{album_id}_thumb.jpg'
+                with open(collage_path, 'rb') as f:
+                    thumb_bytes = f.read()
+                self._client.storage.from_('assets').upload(
+                    path=thumb_storage_path,
+                    file=thumb_bytes,
+                    file_options={'content-type': 'image/jpeg', 'upsert': 'true'},
+                )
+                thumbnail_url = self._client.storage.from_('assets').get_public_url(
+                    thumb_storage_path
+                )
+                logger.info(f'Thumbnail collage uploaded: {thumb_storage_path}')
+            except Exception as e:
+                logger.warning(f'Thumbnail collage generation failed: {e}')
+
             # 7. Create asset record
             on_progress('uploading', 95)
             asset_file_id = str(uuid.uuid4())
-            asset_result = self._client.table('assets').insert({
+            asset_data = {
                 'user_id': user_id,
                 'asset_file_id': asset_file_id,
                 'path': storage_path,
                 'web_uri': public_url,
                 'mediaType': 'video',
                 'media_type': 'video',
-            }).execute()
+            }
+            if thumbnail_url:
+                asset_data['thumbnail'] = thumbnail_url
+            asset_result = self._client.table('assets').insert(asset_data).execute()
 
             asset_id = asset_result.data[0]['id'] if asset_result.data else None
 
@@ -239,6 +263,69 @@ class VideoService:
                 'output_asset_id': asset_id,
                 'output_duration_seconds': duration,
             }
+
+    def _generate_thumbnail_collage(
+        self, image_paths: list[Path], output_path: Path,
+        width: int = 1200, height: int = 630, gap: int = 8,
+    ) -> Path:
+        """Generate a collage thumbnail from up to 5 album photos.
+
+        Layouts:
+          5 images: hero left + 2 stacked right + 2 bottom
+          4 images: 2x2 grid
+          3 images: hero top + 2 bottom
+          2 images: side by side
+          1 image:  single cover
+        """
+        bg = Image.new('RGB', (width, height), (26, 26, 46))
+        n = len(image_paths)
+
+        def load_and_crop(path: Path, w: int, h: int) -> Image.Image:
+            img = Image.open(path).convert('RGB')
+            img = ImageOps.exif_transpose(img)
+            img = ImageOps.fit(img, (w, h), Image.LANCZOS)
+            return img
+
+        if n >= 5:
+            # Hero left, 2 stacked right, 2 bottom
+            top_h = height - gap - (height - gap) // 3
+            bot_h = height - top_h - gap
+            half_w = (width - gap) // 2
+            right_h = (top_h - gap) // 2
+
+            bg.paste(load_and_crop(image_paths[0], half_w, top_h), (0, 0))
+            bg.paste(load_and_crop(image_paths[1], half_w, right_h), (half_w + gap, 0))
+            bg.paste(load_and_crop(image_paths[2], half_w, right_h), (half_w + gap, right_h + gap))
+            bg.paste(load_and_crop(image_paths[3], half_w, bot_h), (0, top_h + gap))
+            bg.paste(load_and_crop(image_paths[4], half_w, bot_h), (half_w + gap, top_h + gap))
+        elif n == 4:
+            # 2x2 grid
+            cell_w = (width - gap) // 2
+            cell_h = (height - gap) // 2
+            bg.paste(load_and_crop(image_paths[0], cell_w, cell_h), (0, 0))
+            bg.paste(load_and_crop(image_paths[1], cell_w, cell_h), (cell_w + gap, 0))
+            bg.paste(load_and_crop(image_paths[2], cell_w, cell_h), (0, cell_h + gap))
+            bg.paste(load_and_crop(image_paths[3], cell_w, cell_h), (cell_w + gap, cell_h + gap))
+        elif n == 3:
+            # Hero top + 2 bottom
+            top_h = height - gap - (height - gap) // 3
+            bot_h = height - top_h - gap
+            half_w = (width - gap) // 2
+            bg.paste(load_and_crop(image_paths[0], width, top_h), (0, 0))
+            bg.paste(load_and_crop(image_paths[1], half_w, bot_h), (0, top_h + gap))
+            bg.paste(load_and_crop(image_paths[2], half_w, bot_h), (half_w + gap, top_h + gap))
+        elif n == 2:
+            # Side by side
+            half_w = (width - gap) // 2
+            bg.paste(load_and_crop(image_paths[0], half_w, height), (0, 0))
+            bg.paste(load_and_crop(image_paths[1], half_w, height), (half_w + gap, 0))
+        else:
+            # Single image
+            bg.paste(load_and_crop(image_paths[0], width, height), (0, 0))
+
+        bg.save(output_path, 'JPEG', quality=85)
+        logger.info(f'Generated {n}-image collage thumbnail: {output_path}')
+        return output_path
 
     def _fetch_album_assets(self, album_id: str) -> list[dict]:
         """Fetch album assets sorted by display order."""
