@@ -901,15 +901,17 @@ class VideoService:
             scale_label = f'sc{i}'
 
             if kb_factor > 0:
-                # Ken Burns: scale larger, animated crop for slow pan
+                # Ken Burns: scale larger, animated crop that pans toward faces
                 margin_x = max(kb_w - OUT_W, 0)
                 margin_y = max(kb_h - OUT_H, 0)
-                # Random pan: pick two corners/edges to pan between
-                rng = random.Random(i)
-                start_x = rng.randint(0, margin_x)
-                start_y = rng.randint(0, margin_y)
-                end_x = margin_x - start_x  # pan to opposite side
-                end_y = margin_y - start_y
+
+                # End on the face-centered crop position
+                end_x = max(0, min(cx, margin_x))
+                end_y = max(0, min(cy, margin_y))
+
+                # Start from the opposite side so the pan moves toward faces
+                start_x = margin_x - end_x
+                start_y = margin_y - end_y
 
                 filter_parts.append(
                     f'[{i}:v]scale={kb_w}:{kb_h}:'
