@@ -39,8 +39,8 @@ TRANSITION_DURATION = 1.0  # seconds
 # Ken Burns zoom factors (how much to scale beyond 1080p for pan room)
 KB_FACTORS = {'none': 0.0, 'mild': 0.15, 'medium': 0.25}
 
-# Max images per FFmpeg batch (prevents OOM on large albums)
-MAX_BATCH_SIZE = 40
+# Max images per FFmpeg batch (keeps total inputs including overlay PNGs manageable)
+MAX_BATCH_SIZE = 15
 
 
 class VideoService:
