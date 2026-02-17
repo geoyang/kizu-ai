@@ -565,41 +565,82 @@ class VideoService:
         card.save(save_path)
         return save_path
 
+    # Possible NotoColorEmoji font paths across Debian/Ubuntu versions
+    _EMOJI_FONT_PATHS = [
+        '/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf',
+        '/usr/share/fonts/truetype/noto-color-emoji/NotoColorEmoji.ttf',
+        '/usr/share/fonts/noto-color-emoji/NotoColorEmoji.ttf',
+        '/usr/share/fonts/truetype/google-noto-color-emoji/NotoColorEmoji.ttf',
+    ]
+
+    def _find_emoji_font(self) -> Optional[str]:
+        """Find the NotoColorEmoji font on the filesystem."""
+        for path in self._EMOJI_FONT_PATHS:
+            if os.path.exists(path):
+                return path
+        return None
+
     def _render_reaction_png(
         self, emoji_char: str, color: str, save_path: Path, size: int = 80,
     ) -> Path:
         """Render a single emoji reaction as a transparent PNG.
 
-        NotoColorEmoji only works at size 109 (native CBDT bitmap size),
-        so we render at 109 then scale down to the target size.
+        Tries color emoji font first (CBDT bitmap at native size 109),
+        then falls back to emoji character on a colored circle.
         """
-        emoji_font_path = '/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf'
-        native_size = 109  # only size NotoColorEmoji supports in Pillow
+        native_size = 109  # only size NotoColorEmoji CBDT supports in Pillow
 
         rendered = False
-        try:
-            font = ImageFont.truetype(emoji_font_path, native_size)
-            # Render at native bitmap size (136x128 glyph)
-            canvas = Image.new('RGBA', (150, 150), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(canvas)
-            draw.text((7, 7), emoji_char, font=font, embedded_color=True)
-            # Crop to content
-            bbox = canvas.getbbox()
-            if bbox:
-                canvas = canvas.crop(bbox)
-            # Scale to target size
-            canvas = canvas.resize((size, size), Image.LANCZOS)
-            canvas.save(save_path)
-            rendered = True
-        except Exception as e:
-            logger.warning(f'NotoColorEmoji render failed for {emoji_char}: {e}')
+        emoji_font_path = self._find_emoji_font()
 
+        # Attempt 1: Color emoji via NotoColorEmoji
+        if emoji_font_path:
+            try:
+                font = ImageFont.truetype(emoji_font_path, native_size)
+                canvas = Image.new('RGBA', (150, 150), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(canvas)
+                draw.text((7, 7), emoji_char, font=font, embedded_color=True)
+                bbox = canvas.getbbox()
+                if bbox:
+                    canvas = canvas.crop(bbox)
+                    canvas = canvas.resize((size, size), Image.LANCZOS)
+                    canvas.save(save_path)
+                    rendered = True
+                else:
+                    logger.warning(
+                        f'Color emoji rendered empty for {repr(emoji_char)}'
+                    )
+            except Exception as e:
+                logger.warning(f'NotoColorEmoji render failed: {e}')
+        else:
+            logger.warning('NotoColorEmoji font not found at any known path')
+
+        # Attempt 2: Emoji character on colored circle background
         if not rendered:
-            # Fallback: colored circle
+            r = int(color[1:3], 16)
+            g = int(color[3:5], 16)
+            b = int(color[5:7], 16)
             card = Image.new('RGBA', (size, size), (0, 0, 0, 0))
             draw = ImageDraw.Draw(card)
-            r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
-            draw.ellipse([8, 8, size - 8, size - 8], fill=(r, g, b, 220))
+            draw.ellipse([4, 4, size - 4, size - 4], fill=(r, g, b, 220))
+
+            # Try to draw the emoji character on top using any available font
+            try:
+                font = ImageFont.truetype(emoji_font_path or '', native_size)
+                # Render emoji on a temp canvas, composite onto circle
+                tmp = Image.new('RGBA', (150, 150), (0, 0, 0, 0))
+                tmp_draw = ImageDraw.Draw(tmp)
+                tmp_draw.text((7, 7), emoji_char, font=font, fill='white')
+                tmp_bbox = tmp.getbbox()
+                if tmp_bbox:
+                    tmp = tmp.crop(tmp_bbox)
+                    emoji_size = size - 16
+                    tmp = tmp.resize((emoji_size, emoji_size), Image.LANCZOS)
+                    offset = (size - emoji_size) // 2
+                    card.paste(tmp, (offset, offset), tmp)
+            except Exception:
+                pass  # Circle-only fallback is fine
+
             card.save(save_path)
 
         return save_path
