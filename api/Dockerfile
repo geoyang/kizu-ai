@@ -22,9 +22,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Fonts for FFmpeg drawtext (emoji reactions + memory text overlays)
+# libraqm + libfribidi required for Pillow color emoji rendering (embedded_color=True)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-color-emoji \
     fonts-dejavu-core \
+    libraqm-dev \
+    libfribidi-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Create app directory
