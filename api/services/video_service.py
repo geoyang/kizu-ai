@@ -871,16 +871,22 @@ class VideoService:
             if kb_factor > 0:
                 margin_x = max(kb_w - OUT_W, 0)
                 margin_y = max(kb_h - OUT_H, 0)
-                end_x = max(0, min(cx, margin_x))
-                end_y = max(0, min(cy, margin_y))
-                start_x = margin_x - end_x
-                start_y = margin_y - end_y
+                # Start centered on faces, drift slightly outward
+                face_x = max(0, min(cx, margin_x))
+                face_y = max(0, min(cy, margin_y))
+                center_x = margin_x // 2
+                center_y = margin_y // 2
+                # Subtle 20% drift away from faces toward center
+                end_x = int(face_x + 0.2 * (center_x - face_x))
+                end_y = int(face_y + 0.2 * (center_y - face_y))
+                end_x = max(0, min(end_x, margin_x))
+                end_y = max(0, min(end_y, margin_y))
                 filter_parts.append(
                     f'[0:v]scale={kb_w}:{kb_h}:'
                     f'force_original_aspect_ratio=increase,'
                     f'crop={OUT_W}:{OUT_H}:'
-                    f'{start_x}+({end_x}-{start_x})*t/{photo_duration:.1f}:'
-                    f'{start_y}+({end_y}-{start_y})*t/{photo_duration:.1f},'
+                    f'{face_x}+({end_x}-{face_x})*t/{photo_duration:.1f}:'
+                    f'{face_y}+({end_y}-{face_y})*t/{photo_duration:.1f},'
                     f'setsar=1,fps=30[base]'
                 )
             else:
@@ -1105,24 +1111,28 @@ class VideoService:
             scale_label = f'sc{i}'
 
             if kb_factor > 0:
-                # Ken Burns: scale larger, animated crop that pans toward faces
+                # Ken Burns: scale larger, animated crop starting on faces
                 margin_x = max(kb_w - OUT_W, 0)
                 margin_y = max(kb_h - OUT_H, 0)
 
-                # End on the face-centered crop position
-                end_x = max(0, min(cx, margin_x))
-                end_y = max(0, min(cy, margin_y))
+                # Start centered on faces
+                face_x = max(0, min(cx, margin_x))
+                face_y = max(0, min(cy, margin_y))
+                center_x = margin_x // 2
+                center_y = margin_y // 2
 
-                # Start from the opposite side so the pan moves toward faces
-                start_x = margin_x - end_x
-                start_y = margin_y - end_y
+                # Subtle 20% drift away from faces toward center
+                end_x = int(face_x + 0.2 * (center_x - face_x))
+                end_y = int(face_y + 0.2 * (center_y - face_y))
+                end_x = max(0, min(end_x, margin_x))
+                end_y = max(0, min(end_y, margin_y))
 
                 filter_parts.append(
                     f'[{i}:v]scale={kb_w}:{kb_h}:'
                     f'force_original_aspect_ratio=increase,'
                     f'crop={OUT_W}:{OUT_H}:'
-                    f'{start_x}+({end_x}-{start_x})*t/{photo_duration:.1f}:'
-                    f'{start_y}+({end_y}-{start_y})*t/{photo_duration:.1f},'
+                    f'{face_x}+({end_x}-{face_x})*t/{photo_duration:.1f}:'
+                    f'{face_y}+({end_y}-{face_y})*t/{photo_duration:.1f},'
                     f'setsar=1,fps=30[{scale_label}]'
                 )
             else:
