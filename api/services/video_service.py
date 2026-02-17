@@ -84,9 +84,11 @@ class VideoService:
 
         Merges stored bounding boxes (from people tags) with auto-detected
         faces. If the combined face region is too large for the crop window,
-        zooms out (increases scale dimensions) to fit all faces.
+        zooms out so all faces fit (may require letterboxing).
 
         Returns (crop_x, crop_y, scale_w, scale_h).
+        When scale_w/scale_h < OUT_W/OUT_H, the render path should use
+        force_original_aspect_ratio=decrease + pad instead of increase + crop.
         """
         try:
             img = Image.open(image_path)
@@ -142,31 +144,28 @@ class VideoService:
             face_region_w = (face_max_x - face_min_x) * cover_scale
             face_region_h = (face_max_y - face_min_y) * cover_scale
 
+            actual_scale = cover_scale
+
             if face_region_w > OUT_W or face_region_h > OUT_H:
-                # Need to zoom out — find scale where face region fits in output
+                # Faces too spread out at cover scale — zoom out to fit them
                 needed_scale = min(
                     OUT_W / (face_max_x - face_min_x),
                     OUT_H / (face_max_y - face_min_y),
                 )
-                # Use whichever is smaller, but ensure we still cover output
                 if needed_scale < cover_scale:
-                    # Scale down — image may not cover output, pad with black
-                    scale_w = round(w * needed_scale)
-                    scale_h = round(h * needed_scale)
-                    # Ensure at least output size (pad handled by FFmpeg pad filter)
                     actual_scale = needed_scale
-                else:
-                    actual_scale = cover_scale
-            else:
-                actual_scale = cover_scale
+                    scale_w = round(w * actual_scale)
+                    scale_h = round(h * actual_scale)
 
             # Face center in scaled coords
             face_cx = ((face_min_x + face_max_x) / 2) * actual_scale
             face_cy = ((face_min_y + face_max_y) / 2) * actual_scale
 
             # Crop origin centered on all faces, clamped to valid range
-            crop_x = int(max(0, min(face_cx - OUT_W / 2, scale_w - OUT_W)))
-            crop_y = int(max(0, min(face_cy - OUT_H / 2, scale_h - OUT_H)))
+            max_cx = max(0, scale_w - OUT_W)
+            max_cy = max(0, scale_h - OUT_H)
+            crop_x = int(max(0, min(face_cx - OUT_W / 2, max_cx)))
+            crop_y = int(max(0, min(face_cy - OUT_H / 2, max_cy)))
 
             return crop_x, crop_y, scale_w, scale_h
 
@@ -968,50 +967,44 @@ class VideoService:
             aid = asset_ids[i] if i < len(asset_ids) else ''
 
             # Per-image scale (may differ if zoomed out for faces)
-            needs_pad = img_sw < OUT_W or img_sh < OUT_H
-            scale_w = max(img_sw, OUT_W)
-            scale_h = max(img_sh, OUT_H)
+            zoom_out = img_sw < OUT_W or img_sh < OUT_H
 
             inputs = ['-loop', '1', '-t', str(photo_duration), '-i', str(image_paths[i])]
             filter_parts = []
 
-            # Scale + crop (with Ken Burns if enabled)
-            if kb_factor > 0:
-                margin_x = max(scale_w - OUT_W, 0)
-                margin_y = max(scale_h - OUT_H, 0)
-                # Start centered on faces, drift slightly outward
+            if zoom_out:
+                # Zoom-out mode: scale to fit, pad to output, no crop/Ken Burns
+                filter_parts.append(
+                    f'[0:v]scale={OUT_W}:{OUT_H}:'
+                    f'force_original_aspect_ratio=decrease,'
+                    f'pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2:black,'
+                    f'setsar=1,fps=30[base]'
+                )
+            elif kb_factor > 0:
+                # Normal Ken Burns: scale to cover, animated crop starting on faces
+                margin_x = max(img_sw - OUT_W, 0)
+                margin_y = max(img_sh - OUT_H, 0)
                 face_x = max(0, min(cx, margin_x))
                 face_y = max(0, min(cy, margin_y))
                 center_x = margin_x // 2
                 center_y = margin_y // 2
-                # Subtle 20% drift away from faces toward center
                 end_x = int(face_x + 0.2 * (center_x - face_x))
                 end_y = int(face_y + 0.2 * (center_y - face_y))
                 end_x = max(0, min(end_x, margin_x))
                 end_y = max(0, min(end_y, margin_y))
-
-                scale_filter = (
-                    f'[0:v]scale={scale_w}:{scale_h}:'
-                    f'force_original_aspect_ratio=increase'
-                )
-                if needs_pad:
-                    scale_filter += f',pad={scale_w}:{scale_h}:(ow-iw)/2:(oh-ih)/2:black'
                 filter_parts.append(
-                    f'{scale_filter},'
+                    f'[0:v]scale={img_sw}:{img_sh}:'
+                    f'force_original_aspect_ratio=increase,'
                     f'crop={OUT_W}:{OUT_H}:'
                     f'{face_x}+({end_x}-{face_x})*t/{photo_duration:.1f}:'
                     f'{face_y}+({end_y}-{face_y})*t/{photo_duration:.1f},'
                     f'setsar=1,fps=30[base]'
                 )
             else:
-                scale_filter = (
-                    f'[0:v]scale={scale_w}:{scale_h}:'
-                    f'force_original_aspect_ratio=increase'
-                )
-                if needs_pad:
-                    scale_filter += f',pad={scale_w}:{scale_h}:(ow-iw)/2:(oh-ih)/2:black'
+                # No Ken Burns: static crop centered on faces
                 filter_parts.append(
-                    f'{scale_filter},'
+                    f'[0:v]scale={img_sw}:{img_sh}:'
+                    f'force_original_aspect_ratio=increase,'
                     f'crop={OUT_W}:{OUT_H}:{cx}:{cy},'
                     f'setsar=1,fps=30[base]'
                 )
@@ -1228,50 +1221,41 @@ class VideoService:
             scale_label = f'sc{i}'
 
             # Per-image scale (may differ if zoomed out for faces)
-            needs_pad = img_sw < OUT_W or img_sh < OUT_H
-            scale_w = max(img_sw, OUT_W)
-            scale_h = max(img_sh, OUT_H)
+            zoom_out = img_sw < OUT_W or img_sh < OUT_H
 
-            if kb_factor > 0:
-                # Ken Burns: animated crop starting on faces
-                margin_x = max(scale_w - OUT_W, 0)
-                margin_y = max(scale_h - OUT_H, 0)
-
-                # Start centered on faces
+            if zoom_out:
+                # Zoom-out mode: scale to fit, pad to output, no crop/Ken Burns
+                filter_parts.append(
+                    f'[{i}:v]scale={OUT_W}:{OUT_H}:'
+                    f'force_original_aspect_ratio=decrease,'
+                    f'pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2:black,'
+                    f'setsar=1,fps=30[{scale_label}]'
+                )
+            elif kb_factor > 0:
+                # Normal Ken Burns: scale to cover, animated crop starting on faces
+                margin_x = max(img_sw - OUT_W, 0)
+                margin_y = max(img_sh - OUT_H, 0)
                 face_x = max(0, min(cx, margin_x))
                 face_y = max(0, min(cy, margin_y))
                 center_x = margin_x // 2
                 center_y = margin_y // 2
-
-                # Subtle 20% drift away from faces toward center
                 end_x = int(face_x + 0.2 * (center_x - face_x))
                 end_y = int(face_y + 0.2 * (center_y - face_y))
                 end_x = max(0, min(end_x, margin_x))
                 end_y = max(0, min(end_y, margin_y))
-
-                scale_filter = (
-                    f'[{i}:v]scale={scale_w}:{scale_h}:'
-                    f'force_original_aspect_ratio=increase'
-                )
-                if needs_pad:
-                    scale_filter += f',pad={scale_w}:{scale_h}:(ow-iw)/2:(oh-ih)/2:black'
                 filter_parts.append(
-                    f'{scale_filter},'
+                    f'[{i}:v]scale={img_sw}:{img_sh}:'
+                    f'force_original_aspect_ratio=increase,'
                     f'crop={OUT_W}:{OUT_H}:'
                     f'{face_x}+({end_x}-{face_x})*t/{photo_duration:.1f}:'
                     f'{face_y}+({end_y}-{face_y})*t/{photo_duration:.1f},'
                     f'setsar=1,fps=30[{scale_label}]'
                 )
             else:
-                # No Ken Burns: static crop
-                scale_filter = (
-                    f'[{i}:v]scale={scale_w}:{scale_h}:'
-                    f'force_original_aspect_ratio=increase'
-                )
-                if needs_pad:
-                    scale_filter += f',pad={scale_w}:{scale_h}:(ow-iw)/2:(oh-ih)/2:black'
+                # No Ken Burns: static crop centered on faces
                 filter_parts.append(
-                    f'{scale_filter},'
+                    f'[{i}:v]scale={img_sw}:{img_sh}:'
+                    f'force_original_aspect_ratio=increase,'
                     f'crop={OUT_W}:{OUT_H}:{cx}:{cy},'
                     f'setsar=1,fps=30[{scale_label}]'
                 )
