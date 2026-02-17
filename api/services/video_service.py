@@ -973,11 +973,16 @@ class VideoService:
             filter_parts = []
 
             if zoom_out:
-                # Zoom-out mode: scale to fit, pad to output, no crop/Ken Burns
+                # Zoom-out mode: scale to fit within output, pad to exact output size
+                # Calculate exact scaled dims to avoid pad < input errors
+                img = Image.open(image_paths[i])
+                iw, ih = img.size
+                fit_scale = min(OUT_W / iw, OUT_H / ih)
+                fit_w = max(2, int(iw * fit_scale) // 2 * 2)  # ensure even
+                fit_h = max(2, int(ih * fit_scale) // 2 * 2)
                 filter_parts.append(
-                    f'[0:v]scale={OUT_W}:{OUT_H}:'
-                    f'force_original_aspect_ratio=decrease,'
-                    f'pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2:black,'
+                    f'[0:v]scale={fit_w}:{fit_h},'
+                    f'pad={OUT_W}:{OUT_H}:({OUT_W}-{fit_w})/2:({OUT_H}-{fit_h})/2:black,'
                     f'setsar=1,fps=30[base]'
                 )
             elif kb_factor > 0:
@@ -1224,11 +1229,16 @@ class VideoService:
             zoom_out = img_sw < OUT_W or img_sh < OUT_H
 
             if zoom_out:
-                # Zoom-out mode: scale to fit, pad to output, no crop/Ken Burns
+                # Zoom-out mode: scale to fit within output, pad to exact output size
+                # Calculate exact scaled dims to avoid pad < input errors
+                img = Image.open(image_paths[i])
+                iw, ih = img.size
+                fit_scale = min(OUT_W / iw, OUT_H / ih)
+                fit_w = max(2, int(iw * fit_scale) // 2 * 2)  # ensure even
+                fit_h = max(2, int(ih * fit_scale) // 2 * 2)
                 filter_parts.append(
-                    f'[{i}:v]scale={OUT_W}:{OUT_H}:'
-                    f'force_original_aspect_ratio=decrease,'
-                    f'pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2:black,'
+                    f'[{i}:v]scale={fit_w}:{fit_h},'
+                    f'pad={OUT_W}:{OUT_H}:({OUT_W}-{fit_w})/2:({OUT_H}-{fit_h})/2:black,'
                     f'setsar=1,fps=30[{scale_label}]'
                 )
             elif kb_factor > 0:

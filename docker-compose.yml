@@ -29,7 +29,7 @@ services:
     build:
       context: .
       dockerfile: api/Dockerfile
-    command: watchmedo auto-restart --directory=/app/api --pattern=*.py --recursive -- python run_worker.py --debug
+    command: watchmedo auto-restart --directory=/app/api --pattern=*.py --recursive -- python run_worker.py
     environment:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
