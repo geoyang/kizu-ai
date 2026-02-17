@@ -39,6 +39,9 @@ TRANSITION_DURATION = 1.0  # seconds
 # Ken Burns zoom factors (how much to scale beyond 1080p for pan room)
 KB_FACTORS = {'none': 0.0, 'mild': 0.15, 'medium': 0.25}
 
+# Max images per FFmpeg batch (prevents OOM on large albums)
+MAX_BATCH_SIZE = 40
+
 
 class VideoService:
     """Generates album slideshow videos with transitions and optional music."""
@@ -236,7 +239,7 @@ class VideoService:
         """Fetch album assets sorted by display order."""
         result = self._client.table('album_assets').select(
             'asset_id, display_order, assets(id, path, web_uri, thumbnail, media_type)'
-        ).eq('album_id', album_id).order('display_order', desc=True).execute()
+        ).eq('album_id', album_id).order('display_order').execute()
 
         assets = []
         for row in (result.data or []):
@@ -688,6 +691,9 @@ class VideoService:
     ) -> float:
         """Render final video with FFmpeg using xfade transitions.
 
+        For large albums (> MAX_BATCH_SIZE), splits into batches, renders
+        each separately, then concatenates to avoid FFmpeg OOM.
+
         Returns video duration in seconds.
         """
         if len(image_paths) == 0:
@@ -699,8 +705,148 @@ class VideoService:
                 image_paths[0], output_path, photo_duration, music_path, cx, cy
             )
 
-        # Build FFmpeg complex filter with xfade transitions
         n = len(image_paths)
+
+        if n > MAX_BATCH_SIZE:
+            return self._render_video_batched(
+                image_paths=image_paths,
+                output_path=output_path,
+                photo_duration=photo_duration,
+                music_path=music_path,
+                overlays=overlays,
+                asset_ids=asset_ids,
+                crop_offsets=crop_offsets,
+                memory_cards=memory_cards,
+                reaction_pngs=reaction_pngs,
+                ken_burns=ken_burns,
+                on_progress=on_progress,
+            )
+
+        return self._render_video_batch(
+            image_paths=image_paths,
+            output_path=output_path,
+            photo_duration=photo_duration,
+            music_path=None,  # music added during concat or single-batch
+            overlays=overlays,
+            asset_ids=asset_ids,
+            crop_offsets=crop_offsets,
+            memory_cards=memory_cards,
+            reaction_pngs=reaction_pngs,
+            ken_burns=ken_burns,
+            on_progress=on_progress,
+            music_for_single=music_path,
+        )
+
+    def _render_video_batched(
+        self,
+        image_paths: list[Path],
+        output_path: Path,
+        photo_duration: float,
+        music_path: Optional[Path],
+        overlays: dict,
+        asset_ids: list[str],
+        crop_offsets: list[tuple[int, int]],
+        memory_cards: dict[str, list[Path]],
+        reaction_pngs: dict[str, list[Path]] | None = None,
+        ken_burns: str = 'mild',
+        on_progress: Callable = lambda s, p: None,
+    ) -> float:
+        """Render large album by splitting into batches and concatenating."""
+        n = len(image_paths)
+        num_batches = (n + MAX_BATCH_SIZE - 1) // MAX_BATCH_SIZE
+        logger.info(f'Large album ({n} images): splitting into {num_batches} batches of up to {MAX_BATCH_SIZE}')
+
+        tmp_dir = output_path.parent
+        batch_paths: list[Path] = []
+        total_duration = 0.0
+
+        for b in range(num_batches):
+            start = b * MAX_BATCH_SIZE
+            end = min(start + MAX_BATCH_SIZE, n)
+            batch_output = tmp_dir / f'batch_{b}.mp4'
+
+            batch_duration = self._render_video_batch(
+                image_paths=image_paths[start:end],
+                output_path=batch_output,
+                photo_duration=photo_duration,
+                music_path=None,
+                overlays=overlays,
+                asset_ids=asset_ids[start:end],
+                crop_offsets=crop_offsets[start:end],
+                memory_cards=memory_cards,
+                reaction_pngs=reaction_pngs,
+                ken_burns=ken_burns,
+                on_progress=on_progress,
+            )
+            batch_paths.append(batch_output)
+            total_duration += batch_duration
+
+            pct = 40 + int(40 * (b + 1) / num_batches)
+            on_progress('encoding_video', pct)
+
+        # Concatenate batches
+        on_progress('encoding_video', 80)
+        concat_list = tmp_dir / 'concat.txt'
+        concat_list.write_text(
+            '\n'.join(f"file '{p}'" for p in batch_paths)
+        )
+
+        concat_cmd = [
+            'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+            '-i', str(concat_list),
+        ]
+
+        if music_path:
+            concat_cmd.extend(['-i', str(music_path), '-shortest'])
+
+        concat_cmd.extend([
+            '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-b:a', '192k',
+            str(output_path),
+        ])
+
+        logger.info(f'Concatenating {len(batch_paths)} batch clips')
+        result = subprocess.run(concat_cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            logger.error(f'Concat FFmpeg stderr:\n{result.stderr}')
+            raise RuntimeError(f'FFmpeg concat failed (rc={result.returncode})')
+
+        return total_duration
+
+    def _render_video_batch(
+        self,
+        image_paths: list[Path],
+        output_path: Path,
+        photo_duration: float,
+        music_path: Optional[Path],
+        overlays: dict,
+        asset_ids: list[str],
+        crop_offsets: list[tuple[int, int]],
+        memory_cards: dict[str, list[Path]],
+        reaction_pngs: dict[str, list[Path]] | None = None,
+        ken_burns: str = 'mild',
+        on_progress: Callable = lambda s, p: None,
+        music_for_single: Optional[Path] = None,
+    ) -> float:
+        """Render a single batch of images into a video clip.
+
+        Returns video duration in seconds.
+        """
+        n = len(image_paths)
+        if n == 0:
+            raise ValueError('No images to render')
+
+        # For single-batch (non-batched) path, use music directly
+        effective_music = music_for_single or music_path
+
+        if n == 1:
+            cx, cy = crop_offsets[0] if crop_offsets else (0, 0)
+            return self._render_single_image(
+                image_paths[0], output_path, photo_duration, effective_music, cx, cy
+            )
+
+        # Build FFmpeg complex filter with xfade transitions
         td = TRANSITION_DURATION
         inputs = []
         filter_parts = []
@@ -709,13 +855,13 @@ class VideoService:
         for path in image_paths:
             inputs.extend(['-loop', '1', '-t', str(photo_duration), '-i', str(path)])
 
-        # Music input
-        if music_path:
-            inputs.extend(['-i', str(music_path)])
+        # Music input (only for single-batch path; batched adds music at concat)
+        if effective_music:
+            inputs.extend(['-i', str(effective_music)])
 
         # Memory card PNG inputs (after images + music)
         card_input_map: dict[str, list[int]] = {}
-        next_idx = n + (1 if music_path else 0)
+        next_idx = n + (1 if effective_music else 0)
         for aid in asset_ids:
             aid_cards = memory_cards.get(aid, [])
             if aid_cards:
@@ -821,7 +967,7 @@ class VideoService:
             '-map', f'[{prev}]',
         ]
 
-        if music_path:
+        if effective_music:
             audio_input_idx = n
             cmd.extend(['-map', f'{audio_input_idx}:a', '-shortest'])
 
