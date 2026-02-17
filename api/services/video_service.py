@@ -132,6 +132,7 @@ class VideoService:
         show_memories = config.get('show_memories', True)
         show_reactions = config.get('show_reactions', True)
         ken_burns = config.get('ken_burns', 'mild')  # 'none', 'mild', 'medium'
+        max_photos = config.get('max_photos')
 
         with tempfile.TemporaryDirectory(prefix='kizu-video-') as tmp:
             tmp_path = Path(tmp)
@@ -141,6 +142,10 @@ class VideoService:
             assets = self._fetch_album_assets(album_id)
             if not assets:
                 raise ValueError('Album has no photos')
+
+            # Limit photo count if max_photos specified
+            if max_photos and len(assets) > max_photos:
+                assets = assets[:max_photos]
 
             # 2. Download photos
             on_progress('downloading_photos', 10)
