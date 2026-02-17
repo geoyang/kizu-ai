@@ -751,44 +751,152 @@ class VideoService:
         ken_burns: str = 'mild',
         on_progress: Callable = lambda s, p: None,
     ) -> float:
-        """Render large album by splitting into batches and concatenating."""
+        """Render large album as individual clips then concatenate.
+
+        Each image becomes a short video clip with its overlays (max ~10
+        FFmpeg inputs each), avoiding the complex multi-input filter graphs
+        that cause segfaults. Clips get fade-in/out for smooth transitions.
+        """
         n = len(image_paths)
-        num_batches = (n + MAX_BATCH_SIZE - 1) // MAX_BATCH_SIZE
-        logger.info(f'Large album ({n} images): splitting into {num_batches} batches of up to {MAX_BATCH_SIZE}')
+        logger.info(f'Large album ({n} images): rendering individual clips + concat')
 
         tmp_dir = output_path.parent
-        batch_paths: list[Path] = []
-        total_duration = 0.0
+        clip_paths: list[Path] = []
+        kb_factor = KB_FACTORS.get(ken_burns, 0.0)
+        kb_w = round(OUT_W * (1 + kb_factor))
+        kb_h = round(OUT_H * (1 + kb_factor))
+        fade_dur = min(0.5, photo_duration / 4)
 
-        for b in range(num_batches):
-            start = b * MAX_BATCH_SIZE
-            end = min(start + MAX_BATCH_SIZE, n)
-            batch_output = tmp_dir / f'batch_{b}.mp4'
+        for i in range(n):
+            clip_path = tmp_dir / f'clip_{i:04d}.mp4'
+            cx, cy = crop_offsets[i] if i < len(crop_offsets) else (0, 0)
+            aid = asset_ids[i] if i < len(asset_ids) else ''
 
-            batch_duration = self._render_video_batch(
-                image_paths=image_paths[start:end],
-                output_path=batch_output,
-                photo_duration=photo_duration,
-                music_path=None,
-                overlays=overlays,
-                asset_ids=asset_ids[start:end],
-                crop_offsets=crop_offsets[start:end],
-                memory_cards=memory_cards,
-                reaction_pngs=reaction_pngs,
-                ken_burns=ken_burns,
-                on_progress=on_progress,
+            inputs = ['-loop', '1', '-t', str(photo_duration), '-i', str(image_paths[i])]
+            filter_parts = []
+
+            # Scale + crop (with Ken Burns if enabled)
+            if kb_factor > 0:
+                margin_x = max(kb_w - OUT_W, 0)
+                margin_y = max(kb_h - OUT_H, 0)
+                end_x = max(0, min(cx, margin_x))
+                end_y = max(0, min(cy, margin_y))
+                start_x = margin_x - end_x
+                start_y = margin_y - end_y
+                filter_parts.append(
+                    f'[0:v]scale={kb_w}:{kb_h}:'
+                    f'force_original_aspect_ratio=increase,'
+                    f'crop={OUT_W}:{OUT_H}:'
+                    f'{start_x}+({end_x}-{start_x})*t/{photo_duration:.1f}:'
+                    f'{start_y}+({end_y}-{start_y})*t/{photo_duration:.1f},'
+                    f'setsar=1,fps=30[base]'
+                )
+            else:
+                filter_parts.append(
+                    f'[0:v]scale={OUT_W}:{OUT_H}:'
+                    f'force_original_aspect_ratio=increase,'
+                    f'crop={OUT_W}:{OUT_H}:{cx}:{cy},'
+                    f'setsar=1,fps=30[base]'
+                )
+
+            current = 'base'
+
+            # Add overlay PNGs for this image's memory cards
+            next_idx = 1
+            aid_cards = memory_cards.get(aid, [])
+            for j, card_path in enumerate(aid_cards[:3]):
+                inputs.extend(['-loop', '1', '-t', str(photo_duration), '-i', str(card_path)])
+                faded = f'cf{j}'
+                out = f'mc{j}'
+                delay = j * 2.0
+                rise_time = max(photo_duration * 2.0, 3.0)
+                card_w = 1080
+                max_drift = OUT_W - card_w
+                mid_x = max_drift // 2
+                drift_amp = max(max_drift // 2, 1)
+                drift_speed = 0.4 + j * 0.15
+                fade_start = max(delay + 1.0, photo_duration - 2.0)
+                start_y = 0.8
+
+                filter_parts.append(
+                    f'[{next_idx}:v]format=rgba,'
+                    f'fade=t=out:st={fade_start:.1f}:d=1.5:alpha=1[{faded}]'
+                )
+                filter_parts.append(
+                    f'[{current}][{faded}]overlay='
+                    f'x={mid_x}+{drift_amp}*sin(t*{drift_speed:.1f}+{j * 2}):'
+                    f'y=if(lt(t\\,{delay:.1f})\\,{start_y}*H\\,'
+                    f'{start_y}*H-({start_y}*H+h)*(t-{delay:.1f})/{rise_time:.1f}):'
+                    f'eof_action=pass[{out}]'
+                )
+                current = out
+                next_idx += 1
+
+            # Add overlay PNGs for this image's reactions
+            if reaction_pngs:
+                aid_rxns = reaction_pngs.get(aid, [])
+                for j, rxn_path in enumerate(aid_rxns[:6]):
+                    inputs.extend(['-loop', '1', '-t', str(photo_duration), '-i', str(rxn_path)])
+                    faded = f'rf{j}'
+                    out = f'emo{j}'
+                    delay = j * 0.6
+                    rise_time = max(photo_duration * 1.5, 2.0)
+                    base_x = 80 + (j * 170) % (OUT_W - 200)
+                    drift_amp = 25
+                    drift_speed = 1.0 + j * 0.4
+                    fade_start = max(delay + 0.5, photo_duration - 1.5)
+
+                    filter_parts.append(
+                        f'[{next_idx}:v]format=rgba,'
+                        f'fade=t=out:st={fade_start:.1f}:d=1.0:alpha=1[{faded}]'
+                    )
+                    filter_parts.append(
+                        f'[{current}][{faded}]overlay='
+                        f'x={base_x}+{drift_amp}*sin(t*{drift_speed:.1f}):'
+                        f'y=if(lt(t\\,{delay:.1f})\\,H\\,'
+                        f'H-(H+80)*(t-{delay:.1f})/{rise_time:.1f}):'
+                        f'eof_action=pass[{out}]'
+                    )
+                    current = out
+                    next_idx += 1
+
+            # Add fade-in/out for smooth transitions between clips
+            fade_out_start = photo_duration - fade_dur
+            filter_parts.append(
+                f'[{current}]fade=t=in:st=0:d={fade_dur:.2f},'
+                f'fade=t=out:st={fade_out_start:.2f}:d={fade_dur:.2f}[out]'
             )
-            batch_paths.append(batch_output)
-            total_duration += batch_duration
 
-            pct = 40 + int(40 * (b + 1) / num_batches)
+            filter_complex = ';\n'.join(filter_parts)
+            filter_script = tmp_dir / f'clip_{i:04d}.filter'
+            filter_script.write_text(filter_complex)
+
+            cmd = ['ffmpeg', '-y'] + inputs + [
+                '-filter_complex_script', str(filter_script),
+                '-map', '[out]',
+                '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                '-pix_fmt', 'yuv420p',
+                str(clip_path),
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                logger.error(f'Clip {i} FFmpeg stderr:\n{result.stderr}')
+                raise RuntimeError(
+                    f'FFmpeg clip {i} failed (rc={result.returncode}): '
+                    f'{result.stderr[-300:]}'
+                )
+
+            clip_paths.append(clip_path)
+
+            pct = 40 + int(35 * (i + 1) / n)
             on_progress('encoding_video', pct)
 
-        # Concatenate batches
-        on_progress('encoding_video', 80)
+        # Concatenate all clips
+        on_progress('encoding_video', 78)
         concat_list = tmp_dir / 'concat.txt'
         concat_list.write_text(
-            '\n'.join(f"file '{p}'" for p in batch_paths)
+            '\n'.join(f"file '{p}'" for p in clip_paths)
         )
 
         concat_cmd = [
@@ -806,12 +914,13 @@ class VideoService:
             str(output_path),
         ])
 
-        logger.info(f'Concatenating {len(batch_paths)} batch clips')
+        logger.info(f'Concatenating {len(clip_paths)} individual clips')
         result = subprocess.run(concat_cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             logger.error(f'Concat FFmpeg stderr:\n{result.stderr}')
             raise RuntimeError(f'FFmpeg concat failed (rc={result.returncode})')
 
+        total_duration = photo_duration * n
         return total_duration
 
     def _render_video_batch(
