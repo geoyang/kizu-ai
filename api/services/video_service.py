@@ -874,7 +874,7 @@ class VideoService:
             cmd = ['ffmpeg', '-y'] + inputs + [
                 '-filter_complex_script', str(filter_script),
                 '-map', '[out]',
-                '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                '-c:v', 'libx264', '-preset', 'fast', '-crf', '28',
                 '-pix_fmt', 'yuv420p',
                 str(clip_path),
             ]
@@ -906,13 +906,16 @@ class VideoService:
 
         if music_path:
             concat_cmd.extend(['-i', str(music_path), '-shortest'])
-
-        concat_cmd.extend([
-            '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
-            '-pix_fmt', 'yuv420p',
-            '-c:a', 'aac', '-b:a', '192k',
-            str(output_path),
-        ])
+            concat_cmd.extend([
+                '-c:v', 'copy',
+                '-c:a', 'aac', '-b:a', '128k',
+                str(output_path),
+            ])
+        else:
+            concat_cmd.extend([
+                '-c', 'copy',
+                str(output_path),
+            ])
 
         logger.info(f'Concatenating {len(clip_paths)} individual clips')
         result = subprocess.run(concat_cmd, capture_output=True, text=True, timeout=600)
