@@ -1120,7 +1120,7 @@ class VideoService:
         ]
 
         if music_path:
-            concat_cmd.extend(['-i', str(music_path), '-shortest'])
+            concat_cmd.extend(['-i', str(music_path)])
             concat_cmd.extend([
                 '-c:v', 'copy',
                 '-c:a', 'aac', '-b:a', '128k',
@@ -1311,7 +1311,7 @@ class VideoService:
 
         if effective_music:
             audio_input_idx = n
-            cmd.extend(['-map', f'{audio_input_idx}:a', '-shortest'])
+            cmd.extend(['-map', f'{audio_input_idx}:a'])
 
         cmd.extend([
             '-c:v', 'libx264',
@@ -1371,7 +1371,7 @@ class VideoService:
             '-i', str(image_path),
         ]
         if music_path:
-            cmd.extend(['-i', str(music_path), '-shortest'])
+            cmd.extend(['-i', str(music_path)])
 
         cmd.extend([
             '-vf', f'scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,'
