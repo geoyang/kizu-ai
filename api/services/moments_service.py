@@ -1,11 +1,12 @@
 """Service for generating photo moments based on location, people, events, and dates."""
 
+import json
 import logging
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any
-import json
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -606,7 +607,7 @@ class MomentsService:
 
             # Build timeline collage: 1 best photo per year
             timeline_asset_ids = self._build_person_timeline(
-                cluster_faces_result.data, assets
+                cluster_faces_result.data, asset_lookup
             )
 
             # Build GeneratedMoment
@@ -648,22 +649,19 @@ class MomentsService:
     def _build_person_timeline(
         self,
         cluster_faces: List[Dict],
-        assets: List[Dict]
+        asset_lookup: Dict[str, Dict]
     ) -> List[str]:
         """
         Build a timeline of 1 best photo per year for a person.
 
         Args:
             cluster_faces: All face_embeddings rows for this cluster
-            assets: User's asset list (with created_at)
+            asset_lookup: Dict mapping asset_id to asset metadata
 
         Returns:
             List of asset_ids ordered chronologically (1 per year)
         """
-        from collections import defaultdict
-
         # Group faces by year
-        asset_lookup = {a['id']: a for a in assets}
         faces_by_year: Dict[int, List[Dict]] = defaultdict(list)
         for face in cluster_faces:
             asset = asset_lookup.get(face['asset_id'])
