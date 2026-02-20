@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any
+import json
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -573,16 +574,16 @@ class MomentsService:
             if then_asset_id == now_asset_id:
                 continue
 
-            # Calculate years_ago, skip if < 3
-            try:
-                then_dt = datetime.fromisoformat(
-                    then_asset['created_at'].replace('Z', '+00:00')
-                )
-                years_ago = today.year - then_dt.year
-                if years_ago < 3:
-                    continue
-            except (ValueError, TypeError):
-                continue
+            # Calculate years_ago from the asset's year
+            then_dt = datetime.fromisoformat(
+                then_asset['created_at'].replace('Z', '+00:00')
+            )
+            years_ago = today.year - then_dt.year
+
+            # Normalize datetimes to naive (strip timezone info)
+            then_date = then_dt.replace(tzinfo=None) if then_dt.tzinfo else then_dt
+            now_dt = now_face.get('_dt', today)
+            now_date = now_dt.replace(tzinfo=None) if hasattr(now_dt, 'tzinfo') and now_dt.tzinfo else now_dt
 
             # Build GeneratedMoment
             moments.append(GeneratedMoment(
@@ -600,9 +601,8 @@ class MomentsService:
                 subtitle=f"{person_name} — {years_ago} years apart",
                 cover_asset_ids=[then_asset_id, now_asset_id],
                 all_asset_ids=[then_asset_id, now_asset_id],
-                date_range_start=then_dt.replace(tzinfo=None) if then_dt.tzinfo else then_dt,
-                date_range_end=now_face.get('_dt', today).replace(tzinfo=None)
-                    if now_face.get('_dt', today).tzinfo else now_face.get('_dt', today),
+                date_range_start=then_date,
+                date_range_end=now_date,
             ))
 
         return moments
@@ -613,7 +613,6 @@ class MomentsService:
         if not bbox:
             return 0.0
         if isinstance(bbox, str):
-            import json
             try:
                 bbox = json.loads(bbox)
             except (json.JSONDecodeError, TypeError):
