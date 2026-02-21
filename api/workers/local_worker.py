@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional, Callable
 
 import httpx
-from PIL import Image
+from PIL import Image, ImageOps
 from supabase import create_client, Client
 
 from api.config import settings
@@ -523,9 +523,17 @@ class UnifiedWorker:
             }).eq('id', asset_id).execute()
 
     def _apply_orientation(self, img: Image.Image, orientation: Optional[int]) -> Image.Image:
-        """Apply EXIF orientation correction."""
+        """Apply EXIF orientation correction.
+
+        If no explicit orientation is provided, reads EXIF from the image itself.
+        This handles chat images where orientation metadata isn't passed through.
+        """
         if not orientation or orientation == 1:
-            return img
+            # No explicit orientation — auto-detect from EXIF embedded in the image
+            try:
+                return ImageOps.exif_transpose(img)
+            except Exception:
+                return img
 
         if orientation not in ORIENTATION_MAP:
             return img
