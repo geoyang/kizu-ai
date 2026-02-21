@@ -143,7 +143,7 @@ class MomentsService:
 
         while True:
             result = self._client.table("assets") \
-                .select("id, path, thumbnail, web_uri, created_at, location_lat, location_lng, location_name, media_type, width, height") \
+                .select("id, path, thumbnail, web_uri, created_at, latitude, longitude, location_name, media_type, width, height") \
                 .eq("user_id", user_id) \
                 .order("created_at", desc=True) \
                 .range(offset, offset + page_size - 1) \
@@ -175,7 +175,7 @@ class MomentsService:
         # Filter assets with valid GPS coordinates
         geo_assets = [
             a for a in assets
-            if a.get('location_lat') and a.get('location_lng')
+            if a.get('latitude') and a.get('longitude')
         ]
 
         if len(geo_assets) < 4:
@@ -187,7 +187,7 @@ class MomentsService:
 
             # Prepare coordinates (lat, lng)
             coords = np.array([
-                [a['location_lat'], a['location_lng']]
+                [a['latitude'], a['longitude']]
                 for a in geo_assets
             ])
 
@@ -225,8 +225,8 @@ class MomentsService:
                 date_end = max(dates) if dates else None
 
                 # Calculate cluster center
-                center_lat = np.mean([a['location_lat'] for a in cluster_assets])
-                center_lng = np.mean([a['location_lng'] for a in cluster_assets])
+                center_lat = np.mean([a['latitude'] for a in cluster_assets])
+                center_lng = np.mean([a['longitude'] for a in cluster_assets])
 
                 # Select cover photos
                 cover_ids = await self._select_cover_photos(
