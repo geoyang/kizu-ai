@@ -50,6 +50,7 @@ DEFAULT_MOMENT_SETTINGS = {
     'moments_people': True,
     'moments_events': True,
     'moments_on_this_day': True,
+    'moments_then_and_now': True,
 }
 
 # Image processing settings
@@ -666,6 +667,7 @@ class UnifiedWorker:
                     'moments_people': ns.get('moments_people', DEFAULT_MOMENT_SETTINGS['moments_people']),
                     'moments_events': ns.get('moments_events', DEFAULT_MOMENT_SETTINGS['moments_events']),
                     'moments_on_this_day': ns.get('moments_on_this_day', DEFAULT_MOMENT_SETTINGS['moments_on_this_day']),
+                    'moments_then_and_now': ns.get('moments_then_and_now', DEFAULT_MOMENT_SETTINGS['moments_then_and_now']),
                 }
         except Exception as e:
             logger.warning(f"Could not fetch user settings: {e}")

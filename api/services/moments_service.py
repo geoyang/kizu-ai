@@ -1,7 +1,9 @@
 """Service for generating photo moments based on location, people, events, and dates."""
 
+import json
 import logging
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any
@@ -101,16 +103,31 @@ class MomentsService:
             moments.extend(people_moments)
             report("People", f"Found {len(people_moments)} people moments", 55)
 
+        # Collect cluster IDs from people moments for deduplication
+        people_cluster_ids = set()
+        for m in moments:
+            if m.grouping_type == 'people':
+                cid = m.grouping_criteria.get('cluster_id')
+                if cid:
+                    people_cluster_ids.add(cid)
+
         # Generate on-this-day moments
         if settings.get('moments_on_this_day', True):
             report("OnThisDay", "Finding historical moments...", 60)
             otd_moments = await self._find_on_this_day(user_id, assets)
             moments.extend(otd_moments)
-            report("OnThisDay", f"Found {len(otd_moments)} on-this-day moments", 75)
+            report("OnThisDay", f"Found {len(otd_moments)} on-this-day moments", 63)
+
+        # Generate then-and-now moments
+        if settings.get('moments_then_and_now', True):
+            report("ThenAndNow", "Finding then and now moments...", 65)
+            tan_moments = await self._find_then_and_now(user_id, assets, people_cluster_ids)
+            moments.extend(tan_moments)
+            report("ThenAndNow", f"Found {len(tan_moments)} then-and-now moments", 72)
 
         # Generate event-based moments (temporal clustering)
         if settings.get('moments_events', True):
-            report("Events", "Detecting events...", 80)
+            report("Events", "Detecting events...", 75)
             event_moments = await self._cluster_by_events(user_id, assets)
             moments.extend(event_moments)
             report("Events", f"Found {len(event_moments)} event moments", 95)
@@ -411,6 +428,272 @@ class MomentsService:
             ))
 
         return moments
+
+    async def _find_then_and_now(
+        self,
+        user_id: str,
+        assets: List[Dict],
+        skip_cluster_ids: Optional[set] = None
+    ) -> List[GeneratedMoment]:
+        """
+        Find Then and Now moments: pair an old photo of a person (3+ years ago today)
+        with a recent photo of the same person. Includes timeline collage.
+        """
+        moments: List[GeneratedMoment] = []
+        max_moments = 3
+        today = datetime.now()
+        current_month = today.month
+        current_day = today.day
+
+        # Step 1: Filter assets from today's month/day that are 3+ years old
+        old_asset_ids = []
+        asset_lookup = {a['id']: a for a in assets}
+
+        for asset in assets:
+            if not asset.get('created_at'):
+                continue
+            try:
+                dt = datetime.fromisoformat(asset['created_at'].replace('Z', '+00:00'))
+                if dt.month == current_month and dt.day == current_day:
+                    years_ago = today.year - dt.year
+                    if years_ago >= 3:
+                        old_asset_ids.append(asset['id'])
+            except (ValueError, TypeError):
+                continue
+
+        if not old_asset_ids:
+            return moments
+
+        # Step 2: Get face_embeddings for those old assets (with cluster_id)
+        all_old_faces = []
+        chunk_size = 100
+        for i in range(0, len(old_asset_ids), chunk_size):
+            chunk = old_asset_ids[i:i + chunk_size]
+            faces_result = self._client.table("face_embeddings") \
+                .select("id, asset_id, cluster_id, bounding_box") \
+                .in_("asset_id", chunk) \
+                .not_.is_("cluster_id", "null") \
+                .execute()
+            if faces_result.data:
+                all_old_faces.extend(faces_result.data)
+
+        if not all_old_faces:
+            return moments
+
+        # Step 3: Group by cluster_id, pick best face per cluster (largest bbox)
+        by_cluster: Dict[str, List[Dict]] = {}
+        for face in all_old_faces:
+            cid = face['cluster_id']
+            if cid not in by_cluster:
+                by_cluster[cid] = []
+            by_cluster[cid].append(face)
+
+        best_then_faces: Dict[str, Dict] = {}
+        for cid, faces in by_cluster.items():
+            best = max(faces, key=lambda f: self._face_bbox_area(f))
+            best_then_faces[cid] = best
+
+        # Skip clusters already featured in people moments
+        if skip_cluster_ids:
+            best_then_faces = {
+                cid: face for cid, face in best_then_faces.items()
+                if cid not in skip_cluster_ids
+            }
+
+        if not best_then_faces:
+            return moments
+
+        # Step 4: For each cluster, find a "now" photo and build the moment
+        for cluster_id, then_face in best_then_faces.items():
+            if len(moments) >= max_moments:
+                break
+
+            then_asset_id = then_face['asset_id']
+            then_asset = asset_lookup.get(then_asset_id)
+            if not then_asset or not then_asset.get('created_at'):
+                continue
+
+            # Get cluster info (name, contact_id)
+            cluster_result = self._client.table("face_clusters") \
+                .select("id, name, contact_id") \
+                .eq("id", cluster_id) \
+                .single() \
+                .execute()
+
+            if not cluster_result.data:
+                continue
+
+            cluster = cluster_result.data
+            person_name = cluster.get('name')
+            contact_id = cluster.get('contact_id')
+
+            # Resolve person name from contact if cluster has no name
+            if not person_name and contact_id:
+                contact_result = self._client.table("contacts") \
+                    .select("display_name") \
+                    .eq("id", contact_id) \
+                    .single() \
+                    .execute()
+                if contact_result.data:
+                    person_name = contact_result.data.get('display_name')
+
+            # Skip unnamed people
+            if not person_name:
+                continue
+
+            # Get all face_embeddings for this cluster
+            cluster_faces_result = self._client.table("face_embeddings") \
+                .select("id, asset_id, bounding_box") \
+                .eq("cluster_id", cluster_id) \
+                .execute()
+
+            if not cluster_faces_result.data:
+                continue
+
+            # Filter to recent faces (last 12 months) by matching against assets list
+            twelve_months_ago = today - timedelta(days=365)
+            recent_faces = []
+            fallback_faces = []
+
+            for face in cluster_faces_result.data:
+                face_asset_id = face['asset_id']
+                if face_asset_id == then_asset_id:
+                    continue  # Exclude the then photo
+
+                face_asset = asset_lookup.get(face_asset_id)
+                if not face_asset or not face_asset.get('created_at'):
+                    continue
+
+                try:
+                    face_dt = datetime.fromisoformat(
+                        face_asset['created_at'].replace('Z', '+00:00')
+                    )
+                    face['_dt'] = face_dt
+                    if face_dt.replace(tzinfo=None) >= twelve_months_ago:
+                        recent_faces.append(face)
+                    else:
+                        fallback_faces.append(face)
+                except (ValueError, TypeError):
+                    continue
+
+            # Use recent faces, fall back to any photo of this person
+            candidate_faces = recent_faces if recent_faces else fallback_faces
+
+            if not candidate_faces:
+                continue
+
+            # Pick most prominent face (bbox area desc, then recency desc)
+            candidate_faces.sort(
+                key=lambda f: (self._face_bbox_area(f), f.get('_dt', datetime.min)),
+                reverse=True
+            )
+            now_face = candidate_faces[0]
+            now_asset_id = now_face['asset_id']
+
+            # Skip if then and now are the same photo
+            if then_asset_id == now_asset_id:
+                continue
+
+            # Calculate years_ago from the asset's year
+            then_dt = datetime.fromisoformat(
+                then_asset['created_at'].replace('Z', '+00:00')
+            )
+            years_ago = today.year - then_dt.year
+
+            # Normalize datetimes to naive (strip timezone info)
+            then_date = then_dt.replace(tzinfo=None) if then_dt.tzinfo else then_dt
+            now_dt = now_face.get('_dt', today)
+            now_date = now_dt.replace(tzinfo=None) if hasattr(now_dt, 'tzinfo') and now_dt.tzinfo else now_dt
+
+            # Build timeline collage: 1 best photo per year
+            timeline_asset_ids = self._build_person_timeline(
+                cluster_faces_result.data, asset_lookup
+            )
+
+            # Build GeneratedMoment
+            moments.append(GeneratedMoment(
+                grouping_type='then_and_now',
+                grouping_criteria={
+                    'cluster_id': cluster_id,
+                    'contact_id': contact_id,
+                    'person_name': person_name,
+                    'years_ago': years_ago,
+                    'then_asset_id': then_asset_id,
+                    'now_asset_id': now_asset_id,
+                    'timeline_asset_ids': timeline_asset_ids,
+                },
+                title="Then and Now",
+                subtitle=f"{person_name} — {years_ago} years apart",
+                cover_asset_ids=[then_asset_id, now_asset_id],
+                all_asset_ids=list(dict.fromkeys(
+                    [then_asset_id, now_asset_id] + timeline_asset_ids
+                )),
+                date_range_start=then_date,
+                date_range_end=now_date,
+            ))
+
+        return moments
+
+    def _face_bbox_area(self, face: Dict) -> float:
+        """Calculate face bounding box area for ranking. Larger = more prominent."""
+        bbox = face.get('bounding_box')
+        if not bbox:
+            return 0.0
+        if isinstance(bbox, str):
+            try:
+                bbox = json.loads(bbox)
+            except (json.JSONDecodeError, TypeError):
+                return 0.0
+        return float(bbox.get('width', 0)) * float(bbox.get('height', 0))
+
+    def _build_person_timeline(
+        self,
+        cluster_faces: List[Dict],
+        asset_lookup: Dict[str, Dict]
+    ) -> List[str]:
+        """
+        Build a timeline of 1 best photo per year for a person.
+
+        Args:
+            cluster_faces: All face_embeddings rows for this cluster
+            asset_lookup: Dict mapping asset_id to asset metadata
+
+        Returns:
+            List of asset_ids ordered chronologically (1 per year)
+        """
+        # Group faces by year
+        faces_by_year: Dict[int, List[Dict]] = defaultdict(list)
+        for face in cluster_faces:
+            asset = asset_lookup.get(face['asset_id'])
+            if not asset or not asset.get('created_at'):
+                continue
+            try:
+                dt = datetime.fromisoformat(
+                    asset['created_at'].replace('Z', '+00:00')
+                )
+                faces_by_year[dt.year].append(face)
+            except (ValueError, TypeError):
+                continue
+
+        if not faces_by_year:
+            return []
+
+        # Pick best photo per year (largest bounding box)
+        timeline = []
+        for year in sorted(faces_by_year.keys()):
+            year_faces = faces_by_year[year]
+            best = max(year_faces, key=lambda f: self._face_bbox_area(f))
+            timeline.append(best['asset_id'])
+
+        # Deduplicate (same asset could appear in multiple years)
+        seen = set()
+        deduped = []
+        for asset_id in timeline:
+            if asset_id not in seen:
+                seen.add(asset_id)
+                deduped.append(asset_id)
+
+        return deduped
 
     async def _cluster_by_events(
         self,
